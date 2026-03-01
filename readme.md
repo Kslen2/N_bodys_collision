@@ -5,8 +5,10 @@
 本程序用于模拟尘埃等多体颗粒在动力学条件下的碰撞与吸积过程，采用离散元方法（DEM）并包含 JKR 黏附接触模型。当前版本主要支持：
 
 - 以 N×N 规则网格初始化颗粒系，周期性边界条件；
+- 以两个多粒子团簇 A/B 为初始条件的碰撞模拟（含 JKR 黏附、滚动/切向力），支持树状/致密等不同内部结构；
 - 输出碰撞与凝聚过程中的快照图像；
-- 记录能量随时间的演化，用于分析团簇形成与演化特征。
+- 记录能量随时间的演化，用于分析团簇形成与演化特征；
+- 在两颗粒情形下对来流速度进行扫描，生成法向恢复系数热力图。
 
 ## 运行环境与依赖
 
@@ -35,17 +37,21 @@ python scripts/run_simulation.py --config configs/default.yaml
 ```text
 N_bodys_collision/
 ├─ configs/
-│  └─ default.yaml
+│  ├─ default.yaml
+│  └─ cluster_collision.yaml
 ├─ data/
 │  ├─ 10_small_t_10e-5_seed6/
-│  └─ 40_small_t_20e-5_seed6/
+│  ├─ 40_small_t_20e-5_seed6/
+|  └─ cluster_collision/
 ├─ scripts/
 │  ├─ pic2video.py
 │  ├─ plot_result.py
-│  └─ run_simulation.py
+│  ├─ run_simulation.py
+│  └─ run_cluster_collision.py
 ├─ src/
 │  ├─ initialization/
-│  │  └─ grid.py
+│  │  ├─ grid.py
+│  │  └─ cluster.py
 │  ├─ io/
 │  │  └─ snapshot_saver.py
 │  ├─ physics/
@@ -86,6 +92,22 @@ N_bodys_collision/
 - 在模拟后期，团簇尺度增大、整体运动减慢，团簇间的有效碰撞率会显著下降。
 
 当前版本推荐直接使用默认配置参数。C++ 接口已移除，保留了 numba 加速实现，但并行方案仍需改动，因此暂不建议开启并行 numba 或自适应时间步长功能（可在配置中自行尝试）。
+
+#### cluster_collision.yaml
+
+该配置文件配合 `scripts/run_cluster_collision.py` 使用，用于控制两团簇 A/B 碰撞问题，主要包括：
+
+- `materials`、`simulation` 段：与 `default.yaml` 中含义基本一致；
+- `cluster` 段：
+	- `N1`, `N2`：团簇 A/B 内颗粒数；
+	- `seed`：控制团簇内部几何结构的随机种子，相同 seed 可完全复现；
+	- `gap_factor`：初始 A/B 团簇之间的间隙（以粒径半径 r 为单位）；
+	- `z_target`：目标平均配位数（每个颗粒的平均邻居数），用于调节团簇内部结构的“紧凑/松散”程度：
+		- 小 `z_target`（≈2–3）→ 更树状/枝状的稀疏团簇；
+		- 大 `z_target`（≈4 以上）→ 更致密、近似块状团簇；
+	- `vxB`, `vyB`：B 团簇质心的初始速度分量（A 质心初始静止在原点）；
+	- `adhesion_vn_thresh`, `adhesion_steps`：两颗粒情形下的黏附判据；
+	- `scan_enabled` 及 `vx_min/vx_max/...`：在 `N1=N2=1` 时启用速度扫描并输出法向恢复系数热力图。
 
 ### data
 
@@ -129,6 +151,19 @@ N_bodys_collision/
 - 预览与调整播放帧率；
 - 导出为常见视频格式（依赖 `opencv-python`）。
 
+#### run_cluster_collision.py
+
+两团簇 A/B 碰撞专用脚本，读取 `configs/cluster_collision.yaml`：
+
+- 根据 `cluster` 段构造两个随机团簇 A/B：
+	- 使用 `src/initialization/cluster.py` 中的随机连通团簇生成器；
+	- 团簇内部颗粒构成连通体，相邻颗粒中心距约为 `2r×0.99`，初始化时已有轻微重叠接触；
+	- 通过 `z_target` 控制平均配位数，从而在“树状（松散）–致密”之间连续调节；
+	- 通过 `seed` 控制几何结构的随机性（相同 seed 完全复现）。
+- 将 A 质心放在原点、静止不动，将 B 放在右侧一定距离，并赋予给定 `(vxB, vyB)` 作为来流速度；
+- 使用 DEM 框架推进时间，输出快照与报告，与 `run_simulation.py` 保持一致格式；
+- 当 `N1=N2=1` 时，可启用两颗粒专用判据与速度扫描：区分未接触/分离/黏附等状态，并生成法向恢复系数热力图。
+
 ### src
 
 #### initialization
@@ -140,6 +175,17 @@ N_bodys_collision/
 - 粒子位置：由网格间距 h 和 N 决定；
 - 初始速度：幅值在 `[vmin, vmax]` 内均匀随机，方向在 [0, 2π) 内均匀随机；
 - 随机性由配置文件中的 `seed` 控制，便于复现实验。
+
+##### cluster.py
+
+团簇初始化程序：在二维六角晶格上生成两个随机连通团簇 A/B，用于 A/B 碰撞脚本。
+
+- 以轴坐标 `(q, s)` 表示六角格点，采用 pointy-top 布局；
+- 使用前沿生长算法逐个添加新颗粒：
+	- 始终保证新颗粒至少与一个已有颗粒接触，因此团簇整体是连通体；
+	- 通过限制每个格点度数上限并对候选位置打分，使实际平均配位数尽量贴近 `z_target`；
+	- 在较小 `z_target` 下优先形成带分支的树状结构，而不是单一长链；
+	- 不同 `seed` 会得到不同的树状/团簇形态，但同一 `seed` 可完全复现。
 
 #### io
 
