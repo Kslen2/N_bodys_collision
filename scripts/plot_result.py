@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import matplotlib.pyplot as plt
 
-dir = 'data/50_small_t_50e-5_seed6'  # 以项目根目录为基准的相对路径，或绝对路径
+dir = 'data/40_small_t_20e-5_seed6_1'  # 以项目根目录为基准的相对路径，或绝对路径
 
 
 def main() -> None:

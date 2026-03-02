@@ -615,8 +615,10 @@ def _scan_vn_gamma_heatmap(
 ) -> None:
     """在 (Vn, gamma) 网格上扫描两颗粒碰撞结果，并输出一张热力图。
 
-    横坐标为法向入射速度 Vn，纵坐标为表面能 gamma，
-    相图值为碰撞后法向相对速度大小 |v_n|。
+    横坐标为法向入射速度 Vn，纵坐标为表面能 gamma。
+    默认相图值为碰撞后法向相对速度大小 |v_n|，
+    当 cluster_cfg["vn_gamma_use_restitution"] 为 true 时，
+    相图值改为法向恢复系数 e_n = |v_after|/|v_before|。
     """
 
     vn_min = float(cluster_cfg.get("vn_min", 0.0))
@@ -626,6 +628,7 @@ def _scan_vn_gamma_heatmap(
     gamma_max = float(cluster_cfg.get("gamma_max", materials.gamma))
     ng = int(cluster_cfg.get("gamma_steps", 5))
     heatmap_filename = str(cluster_cfg.get("vn_gamma_heatmap_filename", "vn_gamma_heatmap.png"))
+    use_restitution = bool(cluster_cfg.get("vn_gamma_use_restitution", False))
 
     adhesion_vn_thresh = float(cluster_cfg.get("adhesion_vn_thresh", 1.0e-4))
     adhesion_steps = int(cluster_cfg.get("adhesion_steps", 50))
@@ -677,7 +680,12 @@ def _scan_vn_gamma_heatmap(
         for fut in concurrent.futures.as_completed(futures):
             ig, ivn, status, event_vn = fut.result()
             if status != "no_collision" and event_vn is not None:
-                Z[ig, ivn] = abs(float(event_vn))
+                if use_restitution:
+                    vn0 = abs(float(vn_vals[ivn]))
+                    if vn0 > 0.0:
+                        Z[ig, ivn] = abs(float(event_vn)) / vn0
+                else:
+                    Z[ig, ivn] = abs(float(event_vn))
 
             done += 1
             _print_progress(done)
@@ -698,8 +706,12 @@ def _scan_vn_gamma_heatmap(
     ax.set_xlabel("Vn (m/s)")
     ax.set_ylabel("gamma (J/m^2)")
     cbar = fig.colorbar(pcm, ax=ax)
-    cbar.set_label("|v_n| at outcome (m/s)")
-    ax.set_title("Two-particle collision outcome in (Vn, gamma)")
+    if use_restitution:
+        cbar.set_label("normal restitution coefficient e_n")
+        ax.set_title("Restitution in (Vn, gamma)")
+    else:
+        cbar.set_label("|v_n| at outcome (m/s)")
+        ax.set_title("Two-particle collision outcome in (Vn, gamma)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)

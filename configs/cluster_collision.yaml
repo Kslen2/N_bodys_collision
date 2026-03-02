@@ -82,4 +82,5 @@ cluster:
   gamma_min: 0.00                # 表面能 gamma 扫描下限 (J/m^2)
   gamma_max: 0.50                # 表面能 gamma 扫描上限 (J/m^2)
   gamma_steps: 51                # gamma 方向采样点数
-  vn_gamma_heatmap_filename: "vn_gamma_heatmap.png"  # (Vn, gamma) 热力图文件名
+  vn_gamma_heatmap_filename: "vn_gamma_heatmap1.png"  # (Vn, gamma) 热力图文件名
+  vn_gamma_use_restitution: true  # 为 true 时，热力图数值改为法向恢复系数 e_n=|v_after|/|v_before|
