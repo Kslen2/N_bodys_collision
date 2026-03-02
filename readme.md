@@ -8,7 +8,9 @@
 - 以两个多粒子团簇 A/B 为初始条件的碰撞模拟（含 JKR 黏附、滚动/切向力），支持树状/致密等不同内部结构；
 - 输出碰撞与凝聚过程中的快照图像；
 - 记录能量随时间的演化，用于分析团簇形成与演化特征；
-- 在两颗粒情形下对来流速度进行扫描，生成法向恢复系数热力图。
+- 在两颗粒情形下支持扫描生成相图：
+	- (|Vx|, Vy) 扫描：输出碰后法向相对速度大小 |v_n|；
+	- (Vn, gamma) 扫描：横轴法向速度 Vn、纵轴表面能 gamma，可输出 |v_n| 或法向恢复系数（可配置）。
 
 ## 运行环境与依赖
 
@@ -45,6 +47,7 @@ N_bodys_collision/
 |  └─ cluster_collision/
 ├─ scripts/
 │  ├─ pic2video.py
+│  ├─ plot_cluster_evolution.py
 │  ├─ plot_result.py
 │  ├─ run_simulation.py
 │  └─ run_cluster_collision.py
@@ -107,13 +110,22 @@ N_bodys_collision/
 		- 大 `z_target`（≈4 以上）→ 更致密、近似块状团簇；
 	- `vxB`, `vyB`：B 团簇质心的初始速度分量（A 质心初始静止在原点）；
 	- `adhesion_vn_thresh`, `adhesion_steps`：两颗粒情形下的黏附判据；
-	- `scan_enabled` 及 `vx_min/vx_max/...`：在 `N1=N2=1` 时启用速度扫描并输出法向恢复系数热力图。
+	- `scan_enabled` 及 `vx_min/vx_max/vx_steps/vy_min/vy_max/vy_steps`：在 `N1=N2=1` 时启用 (|Vx|, Vy) 扫描并输出 |v_n| 热力图；
+	- `vn_gamma_scan_enabled` 及 `vn_min/vn_max/vn_steps/gamma_min/gamma_max/gamma_steps`：在 `N1=N2=1` 时启用 (Vn, gamma) 扫描；
+		- `vn_gamma_heatmap_filename`：输出文件名；
+		- `vn_gamma_use_restitution`：若为 true，则热力图数值不再是 |v_n|，而是法向恢复系数（用“碰后 |v_n| / 碰前 Vn”定义）。
 
 ### data
 
 #### 10_small_t_10e-5_seed6
 
 目录中 `report.txt` 记录了本次模拟的参数信息：N = 10，较小时间步长（未开启自适应时间步长），总模拟时长为 10×10⁻⁵ s，随机种子为 seed = 6。同时提供最终颗粒分布的快照 `final_snapshot.png`。
+
+从近期版本开始，`report.txt` 的数据列在原有能量与最大速度基础上，额外记录了若干结构指标（在每个快照时刻写入一行）：
+
+- `cluster_count`：当前连通体数量（基于 2r 内真实接触构造的接触图）；
+- `coordination_mean`：全局平均配位数（接触图中每个粒子的平均邻居数）；
+- `cluster_rg_mean`：全局连通体平均回转半径（对每个连通体计算回转半径后取平均）。
 
 #### 40_small_t_20e-5_seed6
 
@@ -143,6 +155,20 @@ N_bodys_collision/
 - 检查仿真是否稳定收敛；
 - 复盘物理参数（如接触刚度、阻尼系数等）是否设置合理。
 
+**兼容性说明**
+
+由于 `report.txt` 可能包含更多列（例如团簇结构指标），`plot_result.py` 只读取每行的前 5 列（t、三种能量、Vmax），其余列会自动忽略。
+
+#### plot_cluster_evolution.py
+
+用于绘制团簇结构指标随时间的演化（从 `report.txt` 读取）：
+
+- 连通体数量 `cluster_count`；
+- 全局平均配位数 `coordination_mean`；
+- 全局连通体平均回转半径 `cluster_rg_mean`。
+
+运行后会在同目录输出 `cluster_evolution.png`。
+
 #### pic2video.py
 
 一个基于 GUI 的小工具，可将多张快照图片按顺序拼接为视频，以便动态展示碰撞与凝聚过程。支持：
@@ -162,7 +188,7 @@ N_bodys_collision/
 	- 通过 `seed` 控制几何结构的随机性（相同 seed 完全复现）。
 - 将 A 质心放在原点、静止不动，将 B 放在右侧一定距离，并赋予给定 `(vxB, vyB)` 作为来流速度；
 - 使用 DEM 框架推进时间，输出快照与报告，与 `run_simulation.py` 保持一致格式；
-- 当 `N1=N2=1` 时，可启用两颗粒专用判据与速度扫描：区分未接触/分离/黏附等状态，并生成法向恢复系数热力图。
+- 当 `N1=N2=1` 时，可启用两颗粒专用判据与扫描：区分未接触/分离/黏附等状态，并生成相图（见 `cluster_collision.yaml` 中 scan 配置）。
 
 ### src
 

@@ -1111,6 +1111,49 @@ class DEMSimulator:
         KE_rot = 0.5 * I * float(np.sum(self.state.omega**2))
         return KE_trans, KE_rot, KE_trans + KE_rot
 
+    def _cluster_metrics(self) -> Tuple[int, float, float]:
+        """返回当前结构指标：(连通体数量, 全局平均配位数, 连通体平均回转半径)。"""
+        n = int(self.state.size())
+        if n <= 0:
+            return 0, 0.0, 0.0
+
+        contacts = self._contacts_2r if self._contacts_2r else []
+        comps = connected_components_from_contacts(n, contacts)
+        cluster_count = int(len(comps))
+
+        # 全局平均配位数：接触图中每个粒子的度数平均
+        degree = np.zeros(n, dtype=np.int64)
+        for i, j in contacts:
+            degree[int(i)] += 1
+            degree[int(j)] += 1
+        coordination_mean = float(np.mean(degree))
+
+        # 连通体平均回转半径（包含单粒子连通体，其 Rg 视为 0）
+        rg_sum = 0.0
+        x = self.state.x
+        y = self.state.y
+        use_periodic = (self.Lx > 0.0) and (self.Ly > 0.0)
+        for comp in comps:
+            if not comp:
+                continue
+            if len(comp) == 1:
+                # 单粒子连通体 Rg=0
+                continue
+            mb = np.asarray(comp, dtype=np.int64)
+            ref = int(mb[0])
+            dx = x[mb] - x[ref]
+            dy = y[mb] - y[ref]
+            if use_periodic:
+                dx -= np.round(dx / self.Lx) * self.Lx
+                dy -= np.round(dy / self.Ly) * self.Ly
+            cx = float(np.mean(dx))
+            cy = float(np.mean(dy))
+            rg = float(np.sqrt(np.mean((dx - cx) ** 2 + (dy - cy) ** 2)))
+            rg_sum += rg
+
+        cluster_rg_mean = rg_sum / max(cluster_count, 1)
+        return cluster_count, coordination_mean, cluster_rg_mean
+
     def run(self, t_picture: float | None = None) -> None:
         t = 0.0; step = 0
         start_time = time.perf_counter()
@@ -1160,7 +1203,8 @@ class DEMSimulator:
             self.saver.save(self.state, 0.0, self.Lx, self.Ly, os.path.join(self.sim.snapshot_dir, "snap_000000_t0.000e+00.png"))
             KE_t0, KE_r0, KE_sum0 = self._energies()
             vmax0 = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
-            self.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0)
+            cluster_count0, coord_mean0, rg_mean0 = self._cluster_metrics()
+            self.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
         snap_idx = 0
         # 自适应步长参数
         dt_large = self._dt_normal * float(self.sim.dt_large_factor) if self._adaptive_enabled else self._dt_normal
@@ -1235,7 +1279,8 @@ class DEMSimulator:
                                 max_abs_vn=max_abs_vn)
                 KE_t, KE_r, KE_sum = self._energies()
                 vmax = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
-                self.report.write_step(t, KE_t, KE_r, KE_sum, vmax)
+                cluster_count, coord_mean, rg_mean = self._cluster_metrics()
+                self.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
                 next_snap += snap_dt
 
             self._integrate(fx, fy, tau)
@@ -1249,7 +1294,8 @@ class DEMSimulator:
         self.saver.save(self.state, t, self.Lx, self.Ly, os.path.join(self.sim.snapshot_dir, "final_snapshot.png"))
         KE_tf, KE_rf, KE_sumf = self._energies()
         vmaxf = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
-        self.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf)
+        cluster_countf, coord_meanf, rg_meanf = self._cluster_metrics()
+        self.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf, cluster_countf, coord_meanf, rg_meanf)
         elapsed = time.perf_counter() - start_time
         self.report.write_runtime(elapsed)
         self.report.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import matplotlib.pyplot as plt
 
-dir = 'data/40_small_t_20e-5_seed6_1'  # 以项目根目录为基准的相对路径，或绝对路径
+dir = 'data/30_small_t_30e-5_seed6'  # 以项目根目录为基准的相对路径，或绝对路径
 
 
 def main() -> None:
@@ -27,8 +27,8 @@ def main() -> None:
             if not stripped or stripped.startswith("#"):
                 continue
             parts = stripped.split()
-            if len(parts) == 5:
-                t, a, b, c, v = map(float, parts)
+            if len(parts) >= 5:
+                t, a, b, c, v = map(float, parts[:5])
                 ts.append(t); ket.append(a); ker.append(b); kes.append(c); vmax_list.append(v)
                 has_vmax = True
             elif len(parts) == 4:

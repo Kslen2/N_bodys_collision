@@ -118,7 +118,8 @@ def _run_two_body_with_detection(
         )
         KE_t0, KE_r0, KE_sum0 = _energies(runner)
         vmax0 = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
-        runner.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0)
+        cluster_count0, coord_mean0, rg_mean0 = runner._cluster_metrics()
+        runner.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
 
     t = 0.0
     step = 0
@@ -172,7 +173,8 @@ def _run_two_body_with_detection(
             )
             KE_t, KE_r, KE_sum = _energies(runner)
             vmax = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
-            runner.report.write_step(t, KE_t, KE_r, KE_sum, vmax)
+            cluster_count, coord_mean, rg_mean = runner._cluster_metrics()
+            runner.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
             next_snap += snap_dt
 
         runner._integrate(fx, fy, tau)
@@ -203,7 +205,8 @@ def _run_two_body_with_detection(
     )
     KE_tf, KE_rf, KE_sumf = _energies(runner)
     vmaxf = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
-    runner.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf)
+    cluster_countf, coord_meanf, rg_meanf = runner._cluster_metrics()
+    runner.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf, cluster_countf, coord_meanf, rg_meanf)
     elapsed = time.perf_counter() - start_time
     runner.report.write_runtime(elapsed)
     runner.report.close()

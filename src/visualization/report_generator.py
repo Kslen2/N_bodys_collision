@@ -12,11 +12,30 @@ class ReportWriter:
     def open(self) -> None:
         os.makedirs(self.out_dir, exist_ok=True)
         self.f = open(os.path.join(self.out_dir, "report.txt"), "w", encoding="utf-8")
-        self.f.write("# t(s)\tKE_trans\tKE_rot\tKE_total\tVmax\n")
+        self.f.write(
+            "# t(s)\tKE_trans\tKE_rot\tKE_total\tVmax"
+            "\tcluster_count\tcoordination_mean\tcluster_rg_mean\n"
+        )
 
-    def write_step(self, t: float, KE_t: float, KE_r: float, KE_sum: float, vmax: float) -> None:
+    def write_step(
+        self,
+        t: float,
+        KE_t: float,
+        KE_r: float,
+        KE_sum: float,
+        vmax: float,
+        cluster_count: int | None = None,
+        coordination_mean: float | None = None,
+        cluster_rg_mean: float | None = None,
+    ) -> None:
         if self.f is not None:
-            self.f.write(f"{t:.6e}\t{KE_t:.6e}\t{KE_r:.6e}\t{KE_sum:.6e}\t{vmax:.6e}\n")
+            cc = int(cluster_count) if cluster_count is not None else -1
+            z_mean = float(coordination_mean) if coordination_mean is not None else float("nan")
+            rg_mean = float(cluster_rg_mean) if cluster_rg_mean is not None else float("nan")
+            self.f.write(
+                f"{t:.6e}\t{KE_t:.6e}\t{KE_r:.6e}\t{KE_sum:.6e}\t{vmax:.6e}"
+                f"\t{cc:d}\t{z_mean:.6e}\t{rg_mean:.6e}\n"
+            )
 
     def close(self) -> None:
         if self.f is not None:
