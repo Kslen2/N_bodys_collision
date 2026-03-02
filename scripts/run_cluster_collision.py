@@ -251,6 +251,10 @@ def _simulate_two_body_case(
 ) -> tuple[str, float | None]:
     """单次两颗粒碰撞模拟（无任何快照/报告输出），返回 (status, event_vn)。"""
 
+    # 若初始速度全为 0，显然无法发生接触，直接返回以节省计算
+    if abs(vxB) <= 0.0 and abs(vyB) <= 0.0:
+        return "no_collision", None
+
     # 构造当前速度下的团簇参数
     cluster_params = ClusterInitParams(
         N1=base_cluster.N1,
@@ -536,6 +540,171 @@ def _energies(runner: DEMSimulator) -> tuple[float, float, float]:
     return KE_trans, KE_rot, KE_trans + KE_rot
 
 
+def _vn_gamma_scan_worker(
+    args: tuple[
+        Materials,
+        dict,
+        ClusterInitParams,
+        float,
+        float,
+        float,
+        float,
+        float,
+        int,
+        int,
+    ]
+) -> tuple[int, int, str, float | None]:
+    """(Vn, gamma) 网格并行扫描单个点的辅助函数。
+
+    返回 (ig, ivn, status, event_vn)，由主进程汇总到网格。
+    """
+
+    (
+        base_materials,
+        sim_cfg,
+        base_cluster,
+        vn,
+        gamma,
+        dt,
+        t_end,
+        adhesion_vn_thresh,
+        adhesion_steps,
+        ivn,
+        ig,
+    ) = args
+
+    # 基于给定 gamma 构造局部材料参数
+    materials = Materials(
+        r=float(base_materials.r),
+        rho=float(base_materials.rho),
+        E=float(base_materials.E),
+        nu=float(base_materials.nu),
+        gamma=float(gamma),
+        MU_S=float(base_materials.MU_S),
+        MU_K=float(base_materials.MU_K),
+        e_n=float(base_materials.e_n),
+        mu_r=float(base_materials.mu_r),
+        c_rot=float(base_materials.c_rot),
+    )
+
+    # 仅法向入射：B 从右向左，Vy=0
+    vxB = -float(vn)
+    vyB = 0.0
+
+    status, event_vn = _simulate_two_body_case(
+        materials,
+        sim_cfg,
+        base_cluster,
+        vxB,
+        vyB,
+        dt,
+        t_end,
+        adhesion_vn_thresh,
+        adhesion_steps,
+    )
+    return ig, ivn, status, event_vn
+
+
+def _scan_vn_gamma_heatmap(
+    materials: Materials,
+    sim_cfg: dict,
+    cluster_cfg: dict,
+    base_cluster: ClusterInitParams,
+    dt: float,
+    t_end: float,
+) -> None:
+    """在 (Vn, gamma) 网格上扫描两颗粒碰撞结果，并输出一张热力图。
+
+    横坐标为法向入射速度 Vn，纵坐标为表面能 gamma，
+    相图值为碰撞后法向相对速度大小 |v_n|。
+    """
+
+    vn_min = float(cluster_cfg.get("vn_min", 0.0))
+    vn_max = float(cluster_cfg.get("vn_max", 1.0))
+    nv = int(cluster_cfg.get("vn_steps", 10))
+    gamma_min = float(cluster_cfg.get("gamma_min", materials.gamma))
+    gamma_max = float(cluster_cfg.get("gamma_max", materials.gamma))
+    ng = int(cluster_cfg.get("gamma_steps", 5))
+    heatmap_filename = str(cluster_cfg.get("vn_gamma_heatmap_filename", "vn_gamma_heatmap.png"))
+
+    adhesion_vn_thresh = float(cluster_cfg.get("adhesion_vn_thresh", 1.0e-4))
+    adhesion_steps = int(cluster_cfg.get("adhesion_steps", 50))
+
+    vn_vals = np.linspace(vn_min, vn_max, nv)
+    gamma_vals = np.linspace(gamma_min, gamma_max, ng)
+
+    Z = np.full((ng, nv), np.nan, dtype=float)
+
+    # 构造所有任务列表：每个网格点一个 (Vn, gamma)
+    tasks: list[tuple[Materials, dict, ClusterInitParams, float, float, float, float, float, int, int]] = []
+    for ig, gamma in enumerate(gamma_vals):
+        for ivn, vn in enumerate(vn_vals):
+            tasks.append(
+                (
+                    materials,
+                    sim_cfg,
+                    base_cluster,
+                    float(vn),
+                    float(gamma),
+                    dt,
+                    t_end,
+                    adhesion_vn_thresh,
+                    adhesion_steps,
+                    ivn,
+                    ig,
+                )
+            )
+
+    total = len(tasks)
+    if total == 0:
+        return
+
+    print(f"[SCAN Vn-gamma] 共 {total} 个 (Vn, gamma) 组合，开始并行扫描……")
+
+    # 并行执行，主进程汇总结果并打印进度条
+    done = 0
+    bar_width = 30
+
+    def _print_progress(done_count: int) -> None:
+        ratio = done_count / total
+        filled = int(bar_width * ratio)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        sys.stdout.write(f"\r[SCAN Vn-gamma] 进度: {done_count}/{total} ({ratio*100:5.1f}%) [{bar}]")
+        sys.stdout.flush()
+
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [executor.submit(_vn_gamma_scan_worker, task) for task in tasks]
+        for fut in concurrent.futures.as_completed(futures):
+            ig, ivn, status, event_vn = fut.result()
+            if status != "no_collision" and event_vn is not None:
+                Z[ig, ivn] = abs(float(event_vn))
+
+            done += 1
+            _print_progress(done)
+
+    # 最终保证进度条到 100%
+    _print_progress(total)
+    print()  # 换行
+
+    base_dir = os.path.abspath(sim_cfg.get("snapshot_dir", "data/cluster_collision"))
+    os.makedirs(base_dir, exist_ok=True)
+    out_path = os.path.join(base_dir, heatmap_filename)
+
+    VN, G = np.meshgrid(vn_vals, gamma_vals)
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("white")
+    fig, ax = plt.subplots(figsize=(6, 5))
+    pcm = ax.pcolormesh(VN, G, Z, cmap=cmap, shading="auto")
+    ax.set_xlabel("Vn (m/s)")
+    ax.set_ylabel("gamma (J/m^2)")
+    cbar = fig.colorbar(pcm, ax=ax)
+    cbar.set_label("|v_n| at outcome (m/s)")
+    ax.set_title("Two-particle collision outcome in (Vn, gamma)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -597,11 +766,16 @@ def main() -> None:
     dt = float(sim_cfg["dt"])
     t_end = float(args.t_end) if args.t_end is not None else float(sim_cfg["t_end"])
 
-    # 若启用扫描模式且为两颗粒，则直接进行 (|Vx|, Vy) 扫描并输出热力图
+    # 若启用扫描模式且为两颗粒，则直接进行相应扫描并输出热力图
     scan_enabled = bool(cluster_cfg.get("scan_enabled", False))
-    if scan_enabled and (N1_val == 1) and (N2_val == 1):
-        _scan_velocity_heatmap(materials, sim_cfg, cluster_cfg, cluster_params, dt, t_end)
-        return
+    vn_gamma_scan_enabled = bool(cluster_cfg.get("vn_gamma_scan_enabled", False))
+    if (N1_val == 1) and (N2_val == 1):
+        if scan_enabled:
+            _scan_velocity_heatmap(materials, sim_cfg, cluster_cfg, cluster_params, dt, t_end)
+            return
+        if vn_gamma_scan_enabled:
+            _scan_vn_gamma_heatmap(materials, sim_cfg, cluster_cfg, cluster_params, dt, t_end)
+            return
 
     # ----- 常规模拟：初始化两团簇并建立系统状态 -----
     x, y, vx, vy, omega = initialize_two_clusters(cluster_params, materials.r)

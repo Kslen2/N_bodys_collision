@@ -48,7 +48,7 @@ output:
 
 cluster:
   # 团簇 A/B 的颗粒数
-  N1: 8
+  N1: 1
   N2: 1
   # 控制两团簇内部结构的随机种子（同一 seed 可复现）
   seed: 15
@@ -74,3 +74,12 @@ cluster:
   vy_max: 4.0                  # Vy 扫描上限 (m/s)
   vy_steps: 50                 # Vy 方向采样点数
   heatmap_filename: "vn_heatmap3.png"   # 热力图文件名（保存在 simulation.snapshot_dir 下）
+  # --------- 法向速度-表面能扫描（仅在 N1=N2=1 且 vn_gamma_scan_enabled=true 时生效） ---------
+  vn_gamma_scan_enabled: true   # 开关：true 时在 (Vn, gamma) 网格上扫描
+  vn_min: 0.0                    # 法向入射速度 Vn 扫描下限 (m/s)
+  vn_max: 5.0                    # 法向入射速度 Vn 扫描上限 (m/s)
+  vn_steps: 51                   # Vn 方向采样点数
+  gamma_min: 0.00                # 表面能 gamma 扫描下限 (J/m^2)
+  gamma_max: 0.50                # 表面能 gamma 扫描上限 (J/m^2)
+  gamma_steps: 51                # gamma 方向采样点数
+  vn_gamma_heatmap_filename: "vn_gamma_heatmap.png"  # (Vn, gamma) 热力图文件名
