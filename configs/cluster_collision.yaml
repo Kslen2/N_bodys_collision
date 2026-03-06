@@ -36,10 +36,11 @@ simulation:
   use_jkr_interp: true      # 是否用插值法近似 JKR 法向力（替代牛顿迭代）
   jkr_interp_points: 512    # JKR 插值表点数
   jkr_interp_alpha_factor: 5.0  # 插值上界因子：alpha_max = factor * a0
-  # ---------- 自适应时间步长（按全局最大速度分档） ----------
+  # ---------- 自适应时间步长（按全局最大速度平滑缩放） ----------
   adaptive_timestep: false
-  adaptive_dt_factors: [1, 5, 10, 20, 50]  # 对应基准步长 T 的放大倍数
-  adaptive_vmax_ratio_thresholds: [0.2, 0.1, 0.05, 0.02]  # 触发 5T/10T/20T/50T 的 vmax/vmax0 阈值
+  adaptive_dt_min_factor: 1.0   # 步长倍率下限
+  adaptive_dt_max_factor: 50.0  # 步长倍率上限
+  adaptive_vmax_ema_alpha: 0.2  # vmax 近似值平滑系数（越大响应越快）
 
 output:
   plot: false

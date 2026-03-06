@@ -4,7 +4,7 @@ import os
 import matplotlib.pyplot as plt
 
 
-dir = 'data/30_small_t_30e-5_seed6_1'  # 可改为具体结果目录，如 data/cluster_collision/N1_..._vyB...
+dir = 'data/30_1e-9dt_30e-5_seed6_'  # 可改为具体结果目录，如 data/cluster_collision/N1_..._vyB...
 
 
 def _resolve_target(path: str) -> str:

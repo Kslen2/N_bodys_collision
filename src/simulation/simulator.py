@@ -71,10 +71,11 @@ class SimParams:
     snapshot_show_dt_factor: bool = False
     # 是否启用 C++ pybind11 内核（需先构建并安装 dem_kernels）
     use_cpp: bool = False
-    # ---------- 自适应时间步长参数（按全局最大速度分档） ----------
-    adaptive_timestep: bool = False  # 是否启用按全局最大速度分档的自适应时间步长
-    adaptive_dt_factors: Tuple[float, float, float, float, float] = (1.0, 5.0, 10.0, 20.0, 50.0)
-    adaptive_vmax_ratio_thresholds: Tuple[float, float, float, float] = (0.2, 0.1, 0.05, 0.02)
+    # ---------- 自适应时间步长参数（按全局最大速度平滑缩放） ----------
+    adaptive_timestep: bool = False  # 是否启用按全局最大速度平滑缩放的自适应时间步长
+    adaptive_dt_min_factor: float = 1.0
+    adaptive_dt_max_factor: float = 50.0
+    adaptive_vmax_ema_alpha: float = 0.2  # v_approx = alpha*v_now + (1-alpha)*v_approx
     # 邻域缓存（Verlet 邻居）开关
     use_neighbor_cache: bool = False
     # JKR 法向力是否使用插值近似（替代牛顿迭代）
@@ -170,25 +171,27 @@ class DEMSimulator:
         else:
             self.backend = "python"
         print(f"[DEM] Backend: {self.backend}")
-        # ---------- 自适应时间步长相关（按全局最大速度分档） ----------
+        # ---------- 自适应时间步长相关（按全局最大速度平滑缩放） ----------
         self._adaptive_enabled = bool(getattr(self.sim, "adaptive_timestep", False))
         self._dt_normal = float(self.sim.dt)
-        self._adaptive_dt_factors = tuple(getattr(self.sim, "adaptive_dt_factors", (1.0, 5.0, 10.0, 20.0, 50.0)))
-        if len(self._adaptive_dt_factors) != 5:
-            self._adaptive_dt_factors = (1.0, 5.0, 10.0, 20.0, 50.0)
-        self._adaptive_ratio_thresholds = tuple(getattr(self.sim, "adaptive_vmax_ratio_thresholds", (0.2, 0.1, 0.05, 0.02)))
-        if len(self._adaptive_ratio_thresholds) != 4:
-            self._adaptive_ratio_thresholds = (0.2, 0.1, 0.05, 0.02)
+        self._adaptive_dt_min_factor = max(1.0, float(getattr(self.sim, "adaptive_dt_min_factor", 1.0)))
+        self._adaptive_dt_max_factor = max(self._adaptive_dt_min_factor, float(getattr(self.sim, "adaptive_dt_max_factor", 50.0)))
+        self._adaptive_vmax_ema_alpha = float(getattr(self.sim, "adaptive_vmax_ema_alpha", 0.2))
+        self._adaptive_vmax_ema_alpha = min(max(self._adaptive_vmax_ema_alpha, 0.0), 1.0)
         v_abs0 = np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)
         self._vmax_init = max(float(np.max(v_abs0)), 1e-30)
-        self._adaptive_level_counts = np.zeros(len(self._adaptive_dt_factors), dtype=np.int64)
+        self._vmax_approx = self._vmax_init
+        self._adaptive_factor_sum = 0.0
+        self._adaptive_factor_min = self._adaptive_dt_max_factor
+        self._adaptive_factor_max = self._adaptive_dt_min_factor
         self._contacts_2r: List[Tuple[int,int]] = []
         if self._adaptive_enabled:
             print(
                 f"[DEM] Adaptive timestep: ON "
                 f"(vmax0={self._vmax_init:.3e}, "
-                f"dt_factors={self._adaptive_dt_factors}, "
-                f"ratio_thresholds={self._adaptive_ratio_thresholds})"
+                f"min_factor={self._adaptive_dt_min_factor:.2f}, "
+                f"max_factor={self._adaptive_dt_max_factor:.2f}, "
+                f"ema_alpha={self._adaptive_vmax_ema_alpha:.2f})"
             )
         # Numba 缓冲：避免每步重复分配
         self._nbuf_capacity = 0
@@ -1004,8 +1007,9 @@ class DEMSimulator:
                 "sim.use_numba_parallel": getattr(self.sim, "use_numba_parallel", False),
                 "sim.use_cpp": getattr(self.sim, "use_cpp", False),
                 "sim.adaptive_timestep": getattr(self.sim, "adaptive_timestep", False),
-                "sim.adaptive_dt_factors": tuple(self._adaptive_dt_factors),
-                "sim.adaptive_vmax_ratio_thresholds": tuple(self._adaptive_ratio_thresholds),
+                "sim.adaptive_dt_min_factor": self._adaptive_dt_min_factor,
+                "sim.adaptive_dt_max_factor": self._adaptive_dt_max_factor,
+                "sim.adaptive_vmax_ema_alpha": self._adaptive_vmax_ema_alpha,
                 "sim.adaptive_vmax_init": self._vmax_init,
                 "state.N": int(self.state.size()),
             }
@@ -1043,28 +1047,23 @@ class DEMSimulator:
             dt_factor = 1.0
             vmax_now = float(np.max(np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)))
             if self._adaptive_enabled:
-                ratio = vmax_now / self._vmax_init
-                if ratio < self._adaptive_ratio_thresholds[3]:
-                    dt_factor = self._adaptive_dt_factors[4]
-                    self._adaptive_level_counts[4] += 1
-                elif ratio < self._adaptive_ratio_thresholds[2]:
-                    dt_factor = self._adaptive_dt_factors[3]
-                    self._adaptive_level_counts[3] += 1
-                elif ratio < self._adaptive_ratio_thresholds[1]:
-                    dt_factor = self._adaptive_dt_factors[2]
-                    self._adaptive_level_counts[2] += 1
-                elif ratio < self._adaptive_ratio_thresholds[0]:
-                    dt_factor = self._adaptive_dt_factors[1]
-                    self._adaptive_level_counts[1] += 1
-                else:
-                    dt_factor = self._adaptive_dt_factors[0]
-                    self._adaptive_level_counts[0] += 1
+                a = self._adaptive_vmax_ema_alpha
+                self._vmax_approx = a * vmax_now + (1.0 - a) * self._vmax_approx
+                vmax_eff = max(self._vmax_approx, 1e-30)
+                raw_factor = self._vmax_init / vmax_eff
+                dt_factor = min(max(raw_factor, self._adaptive_dt_min_factor), self._adaptive_dt_max_factor)
                 current_dt = self._dt_normal * dt_factor
             self.sim.dt = current_dt
             is_large_dt = (current_dt > self._dt_normal * 1.01)
             if is_large_dt:
                 n_nonbase_steps += 1
             n_total_steps += 1
+            if self._adaptive_enabled:
+                self._adaptive_factor_sum += dt_factor
+                if dt_factor < self._adaptive_factor_min:
+                    self._adaptive_factor_min = dt_factor
+                if dt_factor > self._adaptive_factor_max:
+                    self._adaptive_factor_max = dt_factor
 
             fx, fy, tau, max_abs_vn, min_approach_time = self._compute_forces()
 
@@ -1075,7 +1074,7 @@ class DEMSimulator:
                 fname = f"snap_{snap_idx:06d}_t{t:.3e}{dt_tag}.png"
                 dt_info = None
                 if bool(getattr(self.sim, "snapshot_show_dt_factor", False)):
-                    dt_info = f"dt={self._dt_normal:.1e}x{dt_factor:.0f}, vmax={vmax_now:.2e}"
+                    dt_info = f"dt={self._dt_normal:.1e}x{dt_factor:.2f}, vmax={vmax_now:.2e}"
                 self.saver.save(self.state, t, self.Lx, self.Ly,
                                 os.path.join(self.sim.snapshot_dir, fname),
                                 dt_info=dt_info,
@@ -1105,14 +1104,13 @@ class DEMSimulator:
         # 自适应步长统计
         if self._adaptive_enabled:
             ratio = n_nonbase_steps / max(n_total_steps, 1) * 100
+            mean_factor = self._adaptive_factor_sum / max(n_total_steps, 1)
             print(f"[DEM] Adaptive stats: {n_nonbase_steps}/{n_total_steps} non-base-dt steps ({ratio:.1f}%)")
             print(
-                "[DEM] Adaptive level counts: "
-                f"x1={int(self._adaptive_level_counts[0])}, "
-                f"x5={int(self._adaptive_level_counts[1])}, "
-                f"x10={int(self._adaptive_level_counts[2])}, "
-                f"x20={int(self._adaptive_level_counts[3])}, "
-                f"x50={int(self._adaptive_level_counts[4])}"
+                "[DEM] Adaptive factor stats: "
+                f"mean={mean_factor:.2f}, "
+                f"min={self._adaptive_factor_min:.2f}, "
+                f"max={self._adaptive_factor_max:.2f}"
             )
 
         # 邻域缓存统计

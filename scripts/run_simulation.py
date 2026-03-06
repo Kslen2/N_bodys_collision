@@ -60,10 +60,11 @@ def main() -> None:
         snapshot_show_velocity=bool(sim.get("snapshot_show_velocity", True)),
         snapshot_show_dt_factor=bool(sim.get("snapshot_show_dt_factor", False)),
         use_cpp=bool(sim.get("use_cpp", False)),
-        # 自适应时间步长（按全局最大速度分档）
+        # 自适应时间步长（按全局最大速度平滑缩放）
         adaptive_timestep=bool(sim.get("adaptive_timestep", False)),
-        adaptive_dt_factors=tuple(float(v) for v in sim.get("adaptive_dt_factors", [1.0, 5.0, 10.0, 20.0, 50.0])),
-        adaptive_vmax_ratio_thresholds=tuple(float(v) for v in sim.get("adaptive_vmax_ratio_thresholds", [0.2, 0.1, 0.05, 0.02])),
+        adaptive_dt_min_factor=float(sim.get("adaptive_dt_min_factor", 1.0)),
+        adaptive_dt_max_factor=float(sim.get("adaptive_dt_max_factor", 50.0)),
+        adaptive_vmax_ema_alpha=float(sim.get("adaptive_vmax_ema_alpha", 0.2)),
         use_neighbor_cache=bool(sim.get("use_neighbor_cache", False)),
         use_jkr_interp=bool(sim.get("use_jkr_interp", False)),
         jkr_interp_points=int(sim.get("jkr_interp_points", 512)),
