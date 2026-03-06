@@ -67,14 +67,14 @@ class SimParams:
     use_numba_parallel: bool = False
     # 快照是否绘制速度信息（速度箭头 + 最快颗粒标注）
     snapshot_show_velocity: bool = True
+    # 快照左下角是否显示当前时间步长倍率
+    snapshot_show_dt_factor: bool = False
     # 是否启用 C++ pybind11 内核（需先构建并安装 dem_kernels）
     use_cpp: bool = False
-    # ---------- 自适应时间步长参数（含团簇刚体化） ----------
-    adaptive_timestep: bool = False          # 是否启用自适应时间步长（含团簇刚体化）
-    dt_large_factor: float = 20.0            # 稳定态步长放大倍数
-    vn_threshold: float = 1e-4               # 法向相对速度阈值 (m/s)，max|v_n| < 此值视为稳定
-    stable_steps_required: int = 50          # 连续满足稳定条件的步数
-    approach_time_factor: float = 2.0        # 碰撞预警：min_approach_time < factor * dt_large 则切回小步长
+    # ---------- 自适应时间步长参数（按全局最大速度分档） ----------
+    adaptive_timestep: bool = False  # 是否启用按全局最大速度分档的自适应时间步长
+    adaptive_dt_factors: Tuple[float, float, float, float, float] = (1.0, 5.0, 10.0, 20.0, 50.0)
+    adaptive_vmax_ratio_thresholds: Tuple[float, float, float, float] = (0.2, 0.1, 0.05, 0.02)
     # 邻域缓存（Verlet 邻居）开关
     use_neighbor_cache: bool = False
     # JKR 法向力是否使用插值近似（替代牛顿迭代）
@@ -170,23 +170,26 @@ class DEMSimulator:
         else:
             self.backend = "python"
         print(f"[DEM] Backend: {self.backend}")
-        # ---------- 自适应时间步长相关 ----------
+        # ---------- 自适应时间步长相关（按全局最大速度分档） ----------
         self._adaptive_enabled = bool(getattr(self.sim, "adaptive_timestep", False))
         self._dt_normal = float(self.sim.dt)
-        self._stable_count = 0  # 连续稳定步数计数器
-        self._using_large_dt = False  # 当前是否在用大步长
-        # ---------- 团簇刚体化状态（由 adaptive_timestep 统一控制） ----------
-        self._cluster_freeze_enabled = self._adaptive_enabled
-        self._frozen_clusters: Dict[int, Dict] = {}
-        self._particle_cluster = np.full(self.state.size(), -1, dtype=np.int64)
-        self._particle_local_idx = np.full(self.state.size(), -1, dtype=np.int64)  # 全局→团簇内局部索引
+        self._adaptive_dt_factors = tuple(getattr(self.sim, "adaptive_dt_factors", (1.0, 5.0, 10.0, 20.0, 50.0)))
+        if len(self._adaptive_dt_factors) != 5:
+            self._adaptive_dt_factors = (1.0, 5.0, 10.0, 20.0, 50.0)
+        self._adaptive_ratio_thresholds = tuple(getattr(self.sim, "adaptive_vmax_ratio_thresholds", (0.2, 0.1, 0.05, 0.02)))
+        if len(self._adaptive_ratio_thresholds) != 4:
+            self._adaptive_ratio_thresholds = (0.2, 0.1, 0.05, 0.02)
+        v_abs0 = np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)
+        self._vmax_init = max(float(np.max(v_abs0)), 1e-30)
+        self._adaptive_level_counts = np.zeros(len(self._adaptive_dt_factors), dtype=np.int64)
         self._contacts_2r: List[Tuple[int,int]] = []
         if self._adaptive_enabled:
-            print(f"[DEM] Adaptive timestep: ON  "
-                  f"(large={self.sim.dt_large_factor}x, "
-                  f"vn_threshold={self.sim.vn_threshold}, "
-                  f"stable_steps={self.sim.stable_steps_required}, "
-                  f"cluster_freeze=ON)")
+            print(
+                f"[DEM] Adaptive timestep: ON "
+                f"(vmax0={self._vmax_init:.3e}, "
+                f"dt_factors={self._adaptive_dt_factors}, "
+                f"ratio_thresholds={self._adaptive_ratio_thresholds})"
+            )
         # Numba 缓冲：避免每步重复分配
         self._nbuf_capacity = 0
         self._nb_i_idx = None
@@ -649,8 +652,6 @@ class DEMSimulator:
             and bool(getattr(self.sim, "use_numba", False))
             and not bool(getattr(self.sim, "use_cpp", False))
             and bool(getattr(self.sim, "use_neighbor_cache", False))
-            and (not self._adaptive_enabled)
-            and (not self._frozen_clusters)
         )
 
         if use_fast_numba_idx and idx_pairs:
@@ -739,60 +740,6 @@ class DEMSimulator:
             if d2 <= max_dist2:
                 d = math.sqrt(d2)
                 pairs.append((i, j, dx, dy, d))
-        # 团簇刚体化：分离对 —— 内部对跳过，冻结-外部对只算接近时间
-        frozen_approach_time = 1e30
-        if self._frozen_clusters:
-            pc = self._particle_cluster
-            force_pairs = []
-            pli = self._particle_local_idx
-            for (i, j, dx, dy, d) in pairs:
-                ci, cj = pc[i], pc[j]
-                if ci >= 0 and ci == cj:
-                    # 检查是否为周期自碰撞：比较刚体距离 vs 周期最小镜像距离
-                    cinfo = self._frozen_clusters[ci]
-                    li, lj = pli[i], pli[j]
-                    drx = cinfo['rel_x'][li] - cinfo['rel_x'][lj]
-                    dry = cinfo['rel_y'][li] - cinfo['rel_y'][lj]
-                    d_rigid = _math.sqrt(drx * drx + dry * dry)
-                    if abs(d_rigid - d) < self.state.r:
-                        continue  # 真正的内部对，跳过
-                    # 周期自碰撞！按冻结-外部对处理
-                    delta_n = 2.0 * self.state.r - d
-                    if delta_n > 0.0:
-                        frozen_approach_time = 0.0
-                    else:
-                        nx = dx / (d + 1e-18)
-                        ny = dy / (d + 1e-18)
-                        v_rel_n = ((self.state.vx[j] - self.state.vx[i]) * nx +
-                                   (self.state.vy[j] - self.state.vy[i]) * ny)
-                        v_approach = -v_rel_n
-                        if v_approach > 1e-18:
-                            gap = d - 2.0 * self.state.r
-                            t_contact = gap / v_approach
-                            if t_contact < frozen_approach_time:
-                                frozen_approach_time = t_contact
-                    continue
-                elif ci >= 0 or cj >= 0:
-                    # 冻结-外部对：检测穿透或计算接近时间
-                    delta_n = 2.0 * self.state.r - d
-                    if delta_n > 0.0:
-                        # 已穿透！立即设 approach_time=0 强制解冻+回退
-                        frozen_approach_time = 0.0
-                    else:
-                        # 未接触：计算接近时间
-                        nx = dx / (d + 1e-18)
-                        ny = dy / (d + 1e-18)
-                        v_rel_n = ((self.state.vx[j] - self.state.vx[i]) * nx +
-                                   (self.state.vy[j] - self.state.vy[i]) * ny)
-                        v_approach = -v_rel_n
-                        if v_approach > 1e-18:
-                            gap = d - 2.0 * self.state.r
-                            t_contact = gap / v_approach
-                            if t_contact < frozen_approach_time:
-                                frozen_approach_time = t_contact
-                else:
-                    force_pairs.append((i, j, dx, dy, d))  # 自由-自由对
-            pairs = force_pairs
         # 若启用并可用 C++ 内核，优先使用 C++
         if (_CPP_AVAILABLE) and bool(getattr(self.sim, "use_cpp", False)) and (len(pairs) > 0):
             m = len(pairs)
@@ -831,7 +778,7 @@ class DEMSimulator:
                     contacts_2r.append(key)
             self._contacts_2r = contacts_2r
             # C++ 内核暂不返回追踪量，使用保守默认值
-            return fx, fy, tau, float('inf'), min(0.0, frozen_approach_time)
+            return fx, fy, tau, float('inf'), 1e30
 
         # 如果启用并可用 Numba，加速对遍历
         if (_NUMBA_AVAILABLE) and bool(getattr(self.sim, "use_numba", False)) and (len(pairs) > 0):
@@ -880,7 +827,7 @@ class DEMSimulator:
                     self.contact_started[key] = True
                     contacts_2r.append(key)
             self._contacts_2r = contacts_2r
-            return fx, fy, tau, float(nb_max_vn), min(float(nb_min_at), frozen_approach_time)
+            return fx, fy, tau, float(nb_max_vn), float(nb_min_at)
 
         # 否则走原有单线程路径
         # 真接触列表（2r 内）用于连通体与切向历史
@@ -958,151 +905,22 @@ class DEMSimulator:
 
         tau += - self.mat.c_rot * self.state.omega
         self._contacts_2r = contacts_2r
-        return fx, fy, tau, py_max_abs_vn, min(py_min_approach, frozen_approach_time)
-
-    # ========== 团簇刚体化 ==========
-    def _try_freeze(self) -> None:
-        """根据当前接触拓扑冻结所有多粒子团簇。"""
-        contacts = self._contacts_2r
-        if not contacts:
-            return
-        n = self.state.size()
-        comps = connected_components_from_contacts(n, contacts)
-        m_particle = self.state.mass
-        self._frozen_clusters.clear()
-        self._particle_cluster[:] = -1
-        for cid, members_list in enumerate(comps):
-            if len(members_list) < 2:
-                continue
-            mb = np.array(members_list, dtype=np.int64)
-            m_total = m_particle * len(mb)
-            # COM（周期最小镜像）
-            ref_x = float(self.state.x[mb[0]])
-            ref_y = float(self.state.y[mb[0]])
-            dx = self.state.x[mb] - ref_x
-            dy = self.state.y[mb] - ref_y
-            dx -= np.round(dx / self.Lx) * self.Lx
-            dy -= np.round(dy / self.Ly) * self.Ly
-            cx = ref_x + float(np.mean(dx))
-            cy = ref_y + float(np.mean(dy))
-            rel_x = dx - float(np.mean(dx))
-            rel_y = dy - float(np.mean(dy))
-            # COM 速度（等质量简化）
-            vx_c = float(np.mean(self.state.vx[mb]))
-            vy_c = float(np.mean(self.state.vy[mb]))
-            # 转动惯量
-            I_p = 0.4 * m_particle * self.state.r ** 2
-            I_total = float(np.sum(m_particle * (rel_x ** 2 + rel_y ** 2))) + len(mb) * I_p
-            # 角动量 → 角速度
-            dvx = self.state.vx[mb] - vx_c
-            dvy = self.state.vy[mb] - vy_c
-            L = float(np.sum(m_particle * (rel_x * dvy - rel_y * dvx)))
-            L += float(np.sum(I_p * self.state.omega[mb]))
-            omega_c = L / max(I_total, 1e-50)
-            self._frozen_clusters[cid] = {
-                'members': mb, 'com_x': cx, 'com_y': cy,
-                'vx': vx_c, 'vy': vy_c, 'omega': omega_c,
-                'mass': m_total, 'I': I_total,
-                'rel_x': rel_x.copy(), 'rel_y': rel_y.copy(),
-            }
-            self._particle_cluster[mb] = cid
-            for k_local in range(len(mb)):
-                self._particle_local_idx[mb[k_local]] = k_local
-        n_frozen = sum(len(c['members']) for c in self._frozen_clusters.values())
-        if self._frozen_clusters:
-            print(f"[DEM] Frozen {len(self._frozen_clusters)} cluster(s), {n_frozen}/{n} particles")
-
-    def _unfreeze_all(self) -> None:
-        """解冻全部团簇，回到逐粒子 DEM。"""
-        if self._frozen_clusters:
-            print(f"[DEM] Unfreezing {len(self._frozen_clusters)} cluster(s)")
-            self._frozen_clusters.clear()
-            self._particle_cluster[:] = -1
-            self._particle_local_idx[:] = -1
-
-    def _update_freeze_state(self, max_abs_vn: float, min_approach_time: float, step: int) -> None:
-        """每步调用：与自适应步长共享 _stable_count，决定冻结/解冻。"""
-        if self._frozen_clusters:
-            # 已冻结：检查是否需要解冻
-            vn_thresh = float(self.sim.vn_threshold)
-            stable_now = (max_abs_vn < vn_thresh)
-            # 始终用 dt_large 作为预警阈值基准，不随当前 dt 模式变化
-            dt_large_ref = self._dt_normal * float(self.sim.dt_large_factor)
-            collision_imminent = (min_approach_time < float(self.sim.approach_time_factor) * dt_large_ref)
-            if (not stable_now) or collision_imminent:
-                self._unfreeze_all()
-                # 联动切回小步长
-                if self._adaptive_enabled:
-                    self._using_large_dt = False
-                    self._stable_count = 0
-        else:
-            # 未冻结：当 _stable_count 达到阈值时触发冻结
-            # （_stable_count 已由自适应步长逻辑维护）
-            if self._stable_count >= self.sim.stable_steps_required:
-                self._try_freeze()
+        return fx, fy, tau, py_max_abs_vn, py_min_approach
 
     def _apply_periodic_wrap(self) -> None:
         # 周期坐标包裹，保持中心域 [-L/2, L/2)
         self.state.x = (self.state.x + 0.5 * self.Lx) % self.Lx - 0.5 * self.Lx
         self.state.y = (self.state.y + 0.5 * self.Ly) % self.Ly - 0.5 * self.Ly
-        # 每步重建邻居，无需缓存失效处理
-        # 如果有冻结团簇，包裹 COM 并用刚体结构重算粒子位置
-        if self._frozen_clusters:
-            hLx = 0.5 * self.Lx; hLy = 0.5 * self.Ly
-            for cinfo in self._frozen_clusters.values():
-                mb = cinfo['members']
-                # 包裹 COM 到主域
-                cx = cinfo['com_x']
-                cy = cinfo['com_y']
-                cx = (cx + hLx) % self.Lx - hLx
-                cy = (cy + hLy) % self.Ly - hLy
-                cinfo['com_x'] = cx
-                cinfo['com_y'] = cy
-                # 粒子位置 = COM + rel，然后单独包裹每个粒子
-                self.state.x[mb] = (cx + cinfo['rel_x'] + hLx) % self.Lx - hLx
-                self.state.y[mb] = (cy + cinfo['rel_y'] + hLy) % self.Ly - hLy
-                # rel 不变（刚体结构不受包裹影响）
 
     def _integrate(self, fx: np.ndarray, fy: np.ndarray, tau: np.ndarray) -> None:
         dt = self.sim.dt
         m = self.state.mass
         I_p = 0.4 * m * (self.state.r ** 2)  # 单粒子惯量
-        if self._frozen_clusters:
-            # --- 冻结团簇：纯惯性漂移（匀速平动 + 匀角速度旋转，不受力） ---
-            for cinfo in self._frozen_clusters.values():
-                mb = cinfo['members']
-                # COM 匀速漂移
-                cinfo['com_x'] += cinfo['vx'] * dt
-                cinfo['com_y'] += cinfo['vy'] * dt
-                # 匀角速度旋转相对位置
-                angle = cinfo['omega'] * dt
-                cos_a = _math.cos(angle); sin_a = _math.sin(angle)
-                rx = cinfo['rel_x']; ry = cinfo['rel_y']
-                new_rx = cos_a * rx - sin_a * ry
-                new_ry = sin_a * rx + cos_a * ry
-                cinfo['rel_x'] = new_rx
-                cinfo['rel_y'] = new_ry
-                # 写回粒子状态
-                self.state.x[mb] = cinfo['com_x'] + new_rx
-                self.state.y[mb] = cinfo['com_y'] + new_ry
-                self.state.vx[mb] = cinfo['vx'] - cinfo['omega'] * new_ry
-                self.state.vy[mb] = cinfo['vy'] + cinfo['omega'] * new_rx
-                self.state.omega[mb] = cinfo['omega']
-            # --- 自由粒子正常 Euler 积分 ---
-            free = self._particle_cluster < 0
-            if np.any(free):
-                self.state.vx[free] += (fx[free] / m) * dt
-                self.state.vy[free] += (fy[free] / m) * dt
-                self.state.omega[free] += (tau[free] / I_p) * dt
-                self.state.x[free] += self.state.vx[free] * dt
-                self.state.y[free] += self.state.vy[free] * dt
-        else:
-            # 全部正常 Euler
-            self.state.vx += (fx / m) * dt
-            self.state.vy += (fy / m) * dt
-            self.state.omega += (tau / I_p) * dt
-            self.state.x += self.state.vx * dt
-            self.state.y += self.state.vy * dt
+        self.state.vx += (fx / m) * dt
+        self.state.vy += (fy / m) * dt
+        self.state.omega += (tau / I_p) * dt
+        self.state.x += self.state.vx * dt
+        self.state.y += self.state.vy * dt
 
     def _energies(self) -> Tuple[float, float, float]:
         m = self.state.mass
@@ -1186,10 +1004,9 @@ class DEMSimulator:
                 "sim.use_numba_parallel": getattr(self.sim, "use_numba_parallel", False),
                 "sim.use_cpp": getattr(self.sim, "use_cpp", False),
                 "sim.adaptive_timestep": getattr(self.sim, "adaptive_timestep", False),
-                "sim.dt_large_factor": getattr(self.sim, "dt_large_factor", 1.0),
-                "sim.vn_threshold": getattr(self.sim, "vn_threshold", 0.0),
-                "sim.stable_steps_required": getattr(self.sim, "stable_steps_required", 0),
-                "sim.approach_time_factor": getattr(self.sim, "approach_time_factor", 0.0),
+                "sim.adaptive_dt_factors": tuple(self._adaptive_dt_factors),
+                "sim.adaptive_vmax_ratio_thresholds": tuple(self._adaptive_ratio_thresholds),
+                "sim.adaptive_vmax_init": self._vmax_init,
                 "state.N": int(self.state.size()),
             }
             # 若 ReportWriter 支持写入参数，则调用；旧版本保持兼容
@@ -1200,69 +1017,56 @@ class DEMSimulator:
             # 参数写入失败不应影响主仿真
             pass
         if snap_dt > 0:
-            self.saver.save(self.state, 0.0, self.Lx, self.Ly, os.path.join(self.sim.snapshot_dir, "snap_000000_t0.000e+00.png"))
+            init_dt_info = None
+            if bool(getattr(self.sim, "snapshot_show_dt_factor", False)):
+                init_dt_info = f"dt={self._dt_normal:.1e}x1"
+            self.saver.save(
+                self.state,
+                0.0,
+                self.Lx,
+                self.Ly,
+                os.path.join(self.sim.snapshot_dir, "snap_000000_t0.000e+00.png"),
+                dt_info=init_dt_info,
+            )
             KE_t0, KE_r0, KE_sum0 = self._energies()
             vmax0 = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
             cluster_count0, coord_mean0, rg_mean0 = self._cluster_metrics()
             self.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
         snap_idx = 0
-        # 自适应步长参数
-        dt_large = self._dt_normal * float(self.sim.dt_large_factor) if self._adaptive_enabled else self._dt_normal
-        vn_thresh = float(self.sim.vn_threshold) if self._adaptive_enabled else 0.0
-        stable_need = int(self.sim.stable_steps_required) if self._adaptive_enabled else 0
-        approach_factor = float(self.sim.approach_time_factor) if self._adaptive_enabled else 2.0
         # 统计
-        n_large_steps = 0
+        n_nonbase_steps = 0
         n_total_steps = 0
 
         while t < self.sim.t_end:
-            # ---- 自适应时间步长决策（基于上一步的归纳结果） ----
+            # ---- 自适应时间步长决策（基于当前全局最大速度） ----
             current_dt = self._dt_normal
-            if self._adaptive_enabled and step > 0:
-                if self._using_large_dt:
-                    current_dt = dt_large
-                elif self._stable_count >= stable_need:
-                    # 稳定条件满足 → 冻结（如有接触）+ 切大步长
-                    if not self._frozen_clusters:
-                        self._try_freeze()
-                    self._using_large_dt = True
-                    current_dt = dt_large
+            dt_factor = 1.0
+            vmax_now = float(np.max(np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)))
+            if self._adaptive_enabled:
+                ratio = vmax_now / self._vmax_init
+                if ratio < self._adaptive_ratio_thresholds[3]:
+                    dt_factor = self._adaptive_dt_factors[4]
+                    self._adaptive_level_counts[4] += 1
+                elif ratio < self._adaptive_ratio_thresholds[2]:
+                    dt_factor = self._adaptive_dt_factors[3]
+                    self._adaptive_level_counts[3] += 1
+                elif ratio < self._adaptive_ratio_thresholds[1]:
+                    dt_factor = self._adaptive_dt_factors[2]
+                    self._adaptive_level_counts[2] += 1
+                elif ratio < self._adaptive_ratio_thresholds[0]:
+                    dt_factor = self._adaptive_dt_factors[1]
+                    self._adaptive_level_counts[1] += 1
+                else:
+                    dt_factor = self._adaptive_dt_factors[0]
+                    self._adaptive_level_counts[0] += 1
+                current_dt = self._dt_normal * dt_factor
             self.sim.dt = current_dt
             is_large_dt = (current_dt > self._dt_normal * 1.01)
             if is_large_dt:
-                n_large_steps += 1
+                n_nonbase_steps += 1
             n_total_steps += 1
 
             fx, fy, tau, max_abs_vn, min_approach_time = self._compute_forces()
-
-            # ---- 自适应状态更新（使用本步计算的力循环结果，零额外开销） ----
-            if self._adaptive_enabled:
-                stable_now = (max_abs_vn < vn_thresh)
-                collision_imminent = (min_approach_time < approach_factor * dt_large)
-
-                if self._using_large_dt:
-                    # 在大步长模式中：检查是否需要切回小步长
-                    if (not stable_now) or collision_imminent:
-                        self._using_large_dt = False
-                        self._stable_count = 0
-                        # 大步长切回时同步解冻
-                        if self._frozen_clusters:
-                            self._unfreeze_all()
-                        # 重新用小步长计算本步（安全回退）
-                        self.sim.dt = self._dt_normal
-                        current_dt = self._dt_normal
-                        is_large_dt = False
-                        fx, fy, tau, max_abs_vn, min_approach_time = self._compute_forces()
-                else:
-                    # 在小步长模式中：累计稳定计数
-                    if stable_now and not collision_imminent:
-                        self._stable_count += 1
-                    else:
-                        self._stable_count = 0
-
-            # ---- 团簇刚体化状态更新 ----
-            if self._adaptive_enabled:
-                self._update_freeze_state(max_abs_vn, min_approach_time, step)
 
             # 快照与报告
             if t >= next_snap:
@@ -1270,9 +1074,8 @@ class DEMSimulator:
                 dt_tag = "_Ldt" if is_large_dt else ""
                 fname = f"snap_{snap_idx:06d}_t{t:.3e}{dt_tag}.png"
                 dt_info = None
-                if is_large_dt:
-                    factor = current_dt / self._dt_normal
-                    dt_info = f"dt={self._dt_normal:.1e}\u00d7{factor:.0f}"
+                if bool(getattr(self.sim, "snapshot_show_dt_factor", False)):
+                    dt_info = f"dt={self._dt_normal:.1e}x{dt_factor:.0f}, vmax={vmax_now:.2e}"
                 self.saver.save(self.state, t, self.Lx, self.Ly,
                                 os.path.join(self.sim.snapshot_dir, fname),
                                 dt_info=dt_info,
@@ -1301,15 +1104,16 @@ class DEMSimulator:
         self.report.close()
         # 自适应步长统计
         if self._adaptive_enabled:
-            ratio = n_large_steps / max(n_total_steps, 1) * 100
-            print(f"[DEM] Adaptive stats: {n_large_steps}/{n_total_steps} large-dt steps ({ratio:.1f}%)")
-        # 团簇刚体化统计
-        if self._adaptive_enabled:
-            if self._frozen_clusters:
-                n_frozen = sum(len(c['members']) for c in self._frozen_clusters.values())
-                print(f"[DEM] Final state: {len(self._frozen_clusters)} frozen cluster(s), {n_frozen}/{self.state.size()} particles")
-            else:
-                print("[DEM] Final state: no frozen clusters")
+            ratio = n_nonbase_steps / max(n_total_steps, 1) * 100
+            print(f"[DEM] Adaptive stats: {n_nonbase_steps}/{n_total_steps} non-base-dt steps ({ratio:.1f}%)")
+            print(
+                "[DEM] Adaptive level counts: "
+                f"x1={int(self._adaptive_level_counts[0])}, "
+                f"x5={int(self._adaptive_level_counts[1])}, "
+                f"x10={int(self._adaptive_level_counts[2])}, "
+                f"x20={int(self._adaptive_level_counts[3])}, "
+                f"x50={int(self._adaptive_level_counts[4])}"
+            )
 
         # 邻域缓存统计
         if bool(getattr(self.sim, "use_neighbor_cache", False)):

@@ -105,6 +105,8 @@ def _run_two_body_with_detection(
     snap_dt = float(sim_params.snapshot_interval or 0.0)
     next_snap = snap_dt if snap_dt > 0.0 else float("inf")
     snap_idx = 0
+    show_dt_factor = bool(getattr(sim_params, "snapshot_show_dt_factor", False))
+    dt_info = f"dt={float(sim_params.dt):.1e}x1" if show_dt_factor else None
 
     # 报告与初始快照
     runner.report.open()
@@ -115,6 +117,7 @@ def _run_two_body_with_detection(
             runner.Lx,
             runner.Ly,
             os.path.join(sim_params.snapshot_dir, "snap_000000_t0.000e+00.png"),
+            dt_info=dt_info,
         )
         KE_t0, KE_r0, KE_sum0 = _energies(runner)
         vmax0 = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
@@ -170,6 +173,7 @@ def _run_two_body_with_detection(
                 runner.Lx,
                 runner.Ly,
                 os.path.join(sim_params.snapshot_dir, fname),
+                dt_info=dt_info,
             )
             KE_t, KE_r, KE_sum = _energies(runner)
             vmax = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
@@ -202,6 +206,7 @@ def _run_two_body_with_detection(
         runner.Lx,
         runner.Ly,
         os.path.join(sim_params.snapshot_dir, "final_snapshot.png"),
+        dt_info=dt_info,
     )
     KE_tf, KE_rf, KE_sumf = _energies(runner)
     vmaxf = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
@@ -296,12 +301,11 @@ def _simulate_two_body_case(
         use_numba=bool(sim_cfg.get("use_numba", False)),
         use_numba_parallel=bool(sim_cfg.get("use_numba_parallel", False)),
         snapshot_show_velocity=False,
+        snapshot_show_dt_factor=bool(sim_cfg.get("snapshot_show_dt_factor", False)),
         use_cpp=bool(sim_cfg.get("use_cpp", False)),
-        adaptive_timestep=False,
-        dt_large_factor=float(sim_cfg.get("dt_large_factor", 20.0)),
-        vn_threshold=float(sim_cfg.get("vn_threshold", 1e-4)),
-        stable_steps_required=int(sim_cfg.get("stable_steps_required", 50)),
-        approach_time_factor=float(sim_cfg.get("approach_time_factor", 2.0)),
+        adaptive_timestep=bool(sim_cfg.get("adaptive_timestep", False)),
+        adaptive_dt_factors=tuple(float(v) for v in sim_cfg.get("adaptive_dt_factors", [1.0, 5.0, 10.0, 20.0, 50.0])),
+        adaptive_vmax_ratio_thresholds=tuple(float(v) for v in sim_cfg.get("adaptive_vmax_ratio_thresholds", [0.2, 0.1, 0.05, 0.02])),
         use_neighbor_cache=bool(sim_cfg.get("use_neighbor_cache", False)),
         use_jkr_interp=bool(sim_cfg.get("use_jkr_interp", False)),
         jkr_interp_points=int(sim_cfg.get("jkr_interp_points", 512)),
@@ -836,12 +840,11 @@ def main() -> None:
         use_numba=bool(sim_cfg.get("use_numba", args.numba)),
         use_numba_parallel=bool(sim_cfg.get("use_numba_parallel", False)),
         snapshot_show_velocity=bool(sim_cfg.get("snapshot_show_velocity", True)),
+        snapshot_show_dt_factor=bool(sim_cfg.get("snapshot_show_dt_factor", False)),
         use_cpp=bool(sim_cfg.get("use_cpp", False)),
-        adaptive_timestep=False,  # 对于本脚本，默认关闭自适应步长与团簇冻结
-        dt_large_factor=float(sim_cfg.get("dt_large_factor", 20.0)),
-        vn_threshold=float(sim_cfg.get("vn_threshold", 1e-4)),
-        stable_steps_required=int(sim_cfg.get("stable_steps_required", 50)),
-        approach_time_factor=float(sim_cfg.get("approach_time_factor", 2.0)),
+        adaptive_timestep=bool(sim_cfg.get("adaptive_timestep", False)),
+        adaptive_dt_factors=tuple(float(v) for v in sim_cfg.get("adaptive_dt_factors", [1.0, 5.0, 10.0, 20.0, 50.0])),
+        adaptive_vmax_ratio_thresholds=tuple(float(v) for v in sim_cfg.get("adaptive_vmax_ratio_thresholds", [0.2, 0.1, 0.05, 0.02])),
         use_neighbor_cache=bool(sim_cfg.get("use_neighbor_cache", False)),
         use_jkr_interp=bool(sim_cfg.get("use_jkr_interp", False)),
         jkr_interp_points=int(sim_cfg.get("jkr_interp_points", 512)),
