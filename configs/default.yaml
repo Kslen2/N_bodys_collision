@@ -19,11 +19,11 @@ initialization:
 
 simulation:
   dt: 2.5e-10        # 时间步 (s)
-  t_end: 30e-5      # 总时长 (s)
+  t_end: 10e-5      # 总时长 (s)
   skin_factor: 0.2   # 邻域skin厚度占 r 的比例 (r_cut=2r+skin)
   snapshot_interval: 1e-6   # 快照间隔 (s)
   save_stride: 1     # 报告步长：每步都写或按 stride 写
-  snapshot_dir: "data/40_small_t_30e-5_seed6"  # 默认不开启并行
+  snapshot_dir: "data/40_small_t_10e-5_seed6"  # 默认不开启并行
   snapshot_show_velocity: false  # 快照是否绘制速度信息（速度箭头 + 最快颗粒标注）
   domain_scale: 1.0  # 盒子大小相对 N*h 的缩放 (1.0 表示 L=N*h)
   use_numba: true    # 是否启用 Numba 加速
