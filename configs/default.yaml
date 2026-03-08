@@ -3,7 +3,7 @@ materials:
   rho: 2650          # 密度 (kg/m^3)
   E: 5.0e10          # 杨氏模量 (Pa)
   nu: 0.3            # 泊松比
-  gamma: 2.5        # 表面能 (J/m^2)
+  gamma: 0.25        # 表面能 (J/m^2)
   MU_S: 0.5          # 静摩擦系数
   MU_K: 0.5          # 动摩擦系数
   e_n: 0.6          # 法向恢复系数 e_n (0<e_n<1)，Tsuji 阻尼公式用
@@ -15,16 +15,16 @@ initialization:
   h: 35.0e-7          # 相邻网格中心距 (m)
   vmin: 0.0          # 初速度幅值下限 (m/s)
   vmax: 4.0          # 初速度幅值上限 (m/s)
-  seed: 6            # 随机种子
+  seed: 15            # 随机种子
 
 simulation:
   dt: 2.5e-10        # 时间步 (s)
   t_end: 30e-5      # 总时长 (s)
   skin_factor: 0.2   # 邻域skin厚度占 r 的比例 (r_cut=2r+skin)
-  snapshot_interval: 1e-5   # 快照间隔 (s)
+  snapshot_interval: 1e-6   # 快照间隔 (s)
   save_stride: 1     # 报告步长：每步都写或按 stride 写
-  snapshot_dir: "data/N30_2.5e-10dt_30e-5_seed6"  # 默认不开启并行
-  snapshot_show_velocity: true  # 快照是否绘制速度信息（速度箭头 + 最快颗粒标注）
+  snapshot_dir: "data/N30_2.5e-10dt_30e-5_seed15_3x3"  # 默认不开启并行
+  snapshot_show_velocity: false  # 快照是否绘制速度信息（速度箭头 + 最快颗粒标注）
   snapshot_show_dt_factor: true  # 快照左下角是否显示当前步长倍率
   domain_scale: 1.0  # 盒子大小相对 N*h 的缩放 (1.0 表示 L=N*h)
   use_numba: true    # 是否启用 Numba 加速
@@ -37,7 +37,7 @@ simulation:
   # ---------- 自适应时间步长（按全局最大速度平滑缩放） ----------
   adaptive_timestep: true
   adaptive_dt_min_factor: 1.0   # 步长倍率下限
-  adaptive_dt_max_factor: 10.0  # 步长倍率上限
+  adaptive_dt_max_factor: 1.0  # 步长倍率上限
   adaptive_vmax_ema_alpha: 0.1  # vmax 近似值平滑系数（越大响应越快）
 
 output:

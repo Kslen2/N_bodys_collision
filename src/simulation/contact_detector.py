@@ -23,7 +23,7 @@ class NeighborParams:
 
 
 # ============================================================
-# Numba 加速版邻域搜索（周期边界 + 5×5 邻域）
+# Numba 加速版邻域搜索（周期边界 + 3×3 邻域）
 # ============================================================
 
 if _NUMBA_AVAILABLE:
@@ -96,7 +96,7 @@ if _NUMBA_AVAILABLE:
         cell_start: np.ndarray, cell_count: np.ndarray, sorted_ids: np.ndarray,
         Nx: int, Ny: int, Lx: float, Ly: float, thresh: float, max_pairs: int
     ):
-        """Numba 邻域搜索（周期边界 + 5×5 邻域）"""
+        """Numba 邻域搜索（周期边界 + 3×3 邻域，要求 cell_size >= thresh）"""
         n = xp.shape[0]
         pair_i = np.empty(max_pairs, dtype=np.int64)
         pair_j = np.empty(max_pairs, dtype=np.int64)
@@ -115,9 +115,9 @@ if _NUMBA_AVAILABLE:
             gx_i = int(xi / cell_x) % Nx
             gy_i = int(yi / cell_y) % Ny
 
-            # 5×5 邻域扫描
-            for dx_cell in range(-2, 3):
-                for dy_cell in range(-2, 3):
+            # 3×3 邻域扫描（cell_size >= thresh 保证无漏检）
+            for dx_cell in range(-1, 2):
+                for dy_cell in range(-1, 2):
                     ng_x = (gx_i + dx_cell) % Nx
                     ng_y = (gy_i + dy_cell) % Ny
                     cell_idx = ng_x * Ny + ng_y
@@ -156,7 +156,7 @@ if _NUMBA_AVAILABLE:
         cell_start: np.ndarray, cell_count: np.ndarray, sorted_ids: np.ndarray,
         Nx: int, Ny: int, Lx: float, Ly: float, thresh: float
     ):
-        """第一阶段：并行统计每个粒子的邻居数量"""
+        """第一阶段：并行统计每个粒子的邻居数量（3×3 邻域）"""
         n = xp.shape[0]
         neighbor_counts = np.zeros(n, dtype=np.int64)
         thresh_sq = thresh * thresh
@@ -170,8 +170,8 @@ if _NUMBA_AVAILABLE:
             gy_i = int(yi / cell_y) % Ny
             local_count = 0
 
-            for dx_cell in range(-2, 3):
-                for dy_cell in range(-2, 3):
+            for dx_cell in range(-1, 2):
+                for dy_cell in range(-1, 2):
                     ng_x = (gx_i + dx_cell) % Nx
                     ng_y = (gy_i + dy_cell) % Ny
                     cell_idx = ng_x * Ny + ng_y
@@ -203,7 +203,7 @@ if _NUMBA_AVAILABLE:
         Nx: int, Ny: int, Lx: float, Ly: float, thresh: float,
         pair_offsets: np.ndarray, total_pairs: int
     ):
-        """第二阶段：并行填充邻居对数据"""
+        """第二阶段：并行填充邻居对数据（3×3 邻域）"""
         n = xp.shape[0]
         pair_i = np.empty(total_pairs, dtype=np.int64)
         pair_j = np.empty(total_pairs, dtype=np.int64)
@@ -222,8 +222,8 @@ if _NUMBA_AVAILABLE:
             gy_i = int(yi / cell_y) % Ny
             write_pos = pair_offsets[i]
 
-            for dx_cell in range(-2, 3):
-                for dy_cell in range(-2, 3):
+            for dx_cell in range(-1, 2):
+                for dy_cell in range(-1, 2):
                     ng_x = (gx_i + dx_cell) % Nx
                     ng_y = (gy_i + dy_cell) % Ny
                     cell_idx = ng_x * Ny + ng_y
@@ -266,6 +266,8 @@ def find_contacts_numba(x: np.ndarray, y: np.ndarray, prm: NeighborParams, use_p
     r, skin = float(prm.r), float(prm.skin)
     thresh = 2.0 * r + max(0.0, skin)
     cell = float(prm.cell_size or thresh)
+    # 确保 cell_size >= thresh，3×3 邻域才不会漏检
+    cell = max(cell, thresh)
     Lx = float(prm.Lx or 0.0)
     Ly = float(prm.Ly or 0.0)
 
@@ -368,6 +370,8 @@ def find_contacts(x: np.ndarray, y: np.ndarray, prm: NeighborParams) -> List[Tup
     r, skin = float(prm.r), float(prm.skin)
     thresh = 2.0 * r + max(0.0, skin)
     cell = float(prm.cell_size or thresh)
+    # 确保 cell_size >= thresh，3×3 邻域才不会漏检
+    cell = max(cell, thresh)
     Lx = float(prm.Lx or 0.0)
     Ly = float(prm.Ly or 0.0)
 
@@ -391,9 +395,9 @@ def find_contacts(x: np.ndarray, y: np.ndarray, prm: NeighborParams) -> List[Tup
         for i in idxs:
             xi = xp[i]
             yi = yp[i]
-            # 5×5 邻域确保覆盖（解决边界对齐问题）
-            for dx_cell in (-2, -1, 0, 1, 2):
-                for dy_cell in (-2, -1, 0, 1, 2):
+            # 3×3 邻域扫描（cell_size >= thresh 保证无漏检）
+            for dx_cell in (-1, 0, 1):
+                for dy_cell in (-1, 0, 1):
                     if Lx > 0.0 and Ly > 0.0:
                         ng_x = (gx + dx_cell) % Nx
                         ng_y = (gy + dy_cell) % Ny
