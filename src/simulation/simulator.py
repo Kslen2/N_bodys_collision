@@ -31,7 +31,7 @@ try:
     from ..physics.contact.tangential import TangentialParams, TangentialFriction
     from ..physics.contact.rolling import RollingParams, RollingResistance
     from .particle_system import SystemState
-    from .contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts
+    from .contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
     from ..io.snapshot_saver import SnapshotSaver
     from ..visualization.report_generator import ReportWriter
 except ImportError:
@@ -45,7 +45,7 @@ except ImportError:
     from multibody_collision_DEM.src.physics.contact.tangential import TangentialParams, TangentialFriction
     from multibody_collision_DEM.src.physics.contact.rolling import RollingParams, RollingResistance
     from multibody_collision_DEM.src.simulation.particle_system import SystemState
-    from multibody_collision_DEM.src.simulation.contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts
+    from multibody_collision_DEM.src.simulation.contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
     from multibody_collision_DEM.src.io.snapshot_saver import SnapshotSaver
     from multibody_collision_DEM.src.visualization.report_generator import ReportWriter
 
@@ -83,6 +83,8 @@ class SimParams:
     # JKR 插值表参数：点数与上界因子（alpha_max = factor * a0）
     jkr_interp_points: int = 512
     jkr_interp_alpha_factor: float = 5.0
+    # 自适应动态网格（四叉树 / 空间哈希）
+    use_adaptive_grid: bool = False
 
 
 class DEMSimulator:
@@ -253,14 +255,26 @@ class DEMSimulator:
         # 统计重建次数
         self._nbr_rebuild_count += 1
 
+        _use_adaptive = bool(getattr(self.sim, "use_adaptive_grid", False))
         if _NUMBA_AVAILABLE and bool(getattr(self.sim, "use_numba", False)):
             use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
-            raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+            if _use_adaptive:
+                raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+            else:
+                raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
         else:
-            raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
+            if _use_adaptive:
+                raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.neigh)
+            else:
+                raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
 
         # 只缓存索引对，避免保存过期的几何信息
-        new_pairs = [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs]
+        # 按 (i, j) 排序，确保 Python/Numba 两条路径的力累加顺序一致，
+        # 消除浮点加法非结合律导致的混沌发散差异。
+        new_pairs = sorted(
+            [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs],
+            key=lambda p: (p[0], p[1]),
+        )
         old_pairs = self._nbr_pairs or []
         old_hist = self._pair_hist
         old_started = self._pair_started_arr
@@ -301,12 +315,22 @@ class DEMSimulator:
 
         # 若未开启邻域缓存，退化为每步完整重建
         if not bool(getattr(self.sim, "use_neighbor_cache", False)):
+            _use_adaptive = bool(getattr(self.sim, "use_adaptive_grid", False))
             if _NUMBA_AVAILABLE and bool(getattr(self.sim, "use_numba", False)):
                 use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
-                raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                if _use_adaptive:
+                    raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                else:
+                    raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
             else:
-                raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
-            return [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs]
+                if _use_adaptive:
+                    raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.neigh)
+                else:
+                    raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
+            return sorted(
+                [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs],
+                key=lambda p: (p[0], p[1]),
+            )
 
         need_rebuild = False
         if self._nbr_pairs is None or self._nbr_ref_x is None or self._nbr_ref_y is None:
@@ -338,7 +362,7 @@ class DEMSimulator:
     # Numba 并行力计算内核（可选）
     # ------------------------------
     if _NUMBA_AVAILABLE:
-        @_njit(fastmath=True)
+        @_njit(cache=True)
         def _numba_build_geometry_from_idx(
             x: np.ndarray,
             y: np.ndarray,
@@ -370,7 +394,7 @@ class DEMSimulator:
                 dy_arr[k] = dy
                 d_arr[k] = _math.sqrt(dx * dx + dy * dy)
 
-        @_njit(parallel=True, fastmath=True)
+        @_njit(cache=True)
         def _numba_force_kernel(
             n: int,
             i_idx: np.ndarray,
@@ -441,7 +465,7 @@ class DEMSimulator:
             # 由 E_star 反解 E（相同材料、相同半径粒子）: E = 2 E* (1-ν^2)
             E_equiv = 2.0 * E_star * (1.0 - nu * nu)
             G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
-            for k in _prange(i_idx.size):
+            for k in range(i_idx.size):
                 i = int(i_idx[k]); j = int(j_idx[k])
                 dxk = dx_arr[k]; dyk = dy_arr[k]; dk = d_arr[k]
                 nx = dxk / (dk + 1e-18)
@@ -499,7 +523,7 @@ class DEMSimulator:
                                 F1_tab = F_tab[idx + 1]
                                 a_interp = a0_tab + (a1_tab - a0_tab) * frac
                                 F_elastic = F0_tab + (F1_tab - F0_tab) * frac
-                                if a_interp > 0.0:
+                                if a_interp > 0.0 and F_elastic != 0.0:
                                     a_contact = a_interp
                                     used_interp = True
 

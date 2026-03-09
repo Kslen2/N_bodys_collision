@@ -33,6 +33,7 @@ simulation:
   use_numba_parallel: false  # 是否启用 Numba 多线程并行（prange）
   use_cpp: false      # 是否启用 C++ pybind11 内核（需先构建并安装）
   use_neighbor_cache: true  # 是否启用邻域缓存（Verlet 邻居）
+  use_adaptive_grid: true   # 启用自适应动态网格（团簇碰撞场景推荐）
   use_jkr_interp: true      # 是否用插值法近似 JKR 法向力（替代牛顿迭代）
   jkr_interp_points: 512    # JKR 插值表点数
   jkr_interp_alpha_factor: 5.0  # 插值上界因子：alpha_max = factor * a0

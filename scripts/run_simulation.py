@@ -66,6 +66,7 @@ def main() -> None:
         adaptive_dt_max_factor=float(sim.get("adaptive_dt_max_factor", 50.0)),
         adaptive_vmax_ema_alpha=float(sim.get("adaptive_vmax_ema_alpha", 0.2)),
         use_neighbor_cache=bool(sim.get("use_neighbor_cache", False)),
+        use_adaptive_grid=bool(sim.get("use_adaptive_grid", False)),
         use_jkr_interp=bool(sim.get("use_jkr_interp", False)),
         jkr_interp_points=int(sim.get("jkr_interp_points", 512)),
         jkr_interp_alpha_factor=float(sim.get("jkr_interp_alpha_factor", 5.0)),

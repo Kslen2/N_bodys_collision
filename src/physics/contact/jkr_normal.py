@@ -293,6 +293,9 @@ class JKRNormal:
             F_adhesion = math.sqrt(8.0 * math.pi * self.Gamma * self.E_star * a3)
             F_elastic = F_hertz - F_adhesion
 
+        # 同步更新 last_newton_a，供外部读取接触半径（插值成功时也需要）
+        self.last_newton_a = a
+
         # 4) 阻尼项：基于当前切线刚度估算 k_n = dF_n/dδ_n
         # 这里采用文献 Tsuji 等提出的法向阻尼力公式：
         #   F_dn = -2 * sqrt(5/6) * β * sqrt(k_n * m*) * v^n
