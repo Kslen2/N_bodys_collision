@@ -16,12 +16,15 @@ class InitParams:
     seed: int | None = None
 
 
-def initialize_grid(params: InitParams, r: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def initialize_grid(params: InitParams, r: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                                            np.ndarray, np.ndarray, np.ndarray,
+                                                            np.ndarray, np.ndarray, np.ndarray,
+                                                            np.ndarray]:
     """
-    生成 N×N 网格的初始粒子：每个网格中心放一粒，速度幅值均匀随机于 [vmin, vmax]，方向均匀随机。
+    生成 N×N×N 网格的初始粒子：每个网格中心放一粒，速度幅值均匀随机于 [vmin, vmax]，方向均匀随机（三维）。
 
     Returns:
-        x, y, vx, vy, omega 数组（均为 float64）。omega 初始为 0。
+        x, y, z, vx, vy, vz, omega_x, omega_y, omega_z 数组（均为 float64）。omega 初始为 0。
     """
     if params.seed is not None:
         random.seed(params.seed)
@@ -33,26 +36,40 @@ def initialize_grid(params: InitParams, r: float) -> Tuple[np.ndarray, np.ndarra
     half = 0.5 * L
     x0 = -half + 0.5 * h
     y0 = -half + 0.5 * h
+    z0 = -half + 0.5 * h
 
     xs: List[float] = []
     ys: List[float] = []
+    zs: List[float] = []
     vxs: List[float] = []
     vys: List[float] = []
+    vzs: List[float] = []
 
-    for iy in range(N):
-        cy = y0 + iy * h
-        for ix in range(N):
-            cx = x0 + ix * h
-            xs.append(cx)
-            ys.append(cy)
-            theta = random.random() * 2.0 * math.pi
-            vmag = random.uniform(params.vmin, params.vmax)
-            vxs.append(vmag * math.cos(theta))
-            vys.append(vmag * math.sin(theta))
+    for iz in range(N):
+        cz = z0 + iz * h
+        for iy in range(N):
+            cy = y0 + iy * h
+            for ix in range(N):
+                cx = x0 + ix * h
+                xs.append(cx)
+                ys.append(cy)
+                zs.append(cz)
+                # 球面均匀随机方向
+                cos_theta = random.uniform(-1.0, 1.0)
+                sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+                phi = random.random() * 2.0 * math.pi
+                vmag = random.uniform(params.vmin, params.vmax)
+                vxs.append(vmag * sin_theta * math.cos(phi))
+                vys.append(vmag * sin_theta * math.sin(phi))
+                vzs.append(vmag * cos_theta)
 
     x = np.array(xs, dtype=float)
     y = np.array(ys, dtype=float)
+    z = np.array(zs, dtype=float)
     vx = np.array(vxs, dtype=float)
     vy = np.array(vys, dtype=float)
-    omega = np.zeros_like(x)
-    return x, y, vx, vy, omega
+    vz = np.array(vzs, dtype=float)
+    omega_x = np.zeros_like(x)
+    omega_y = np.zeros_like(x)
+    omega_z = np.zeros_like(x)
+    return x, y, z, vx, vy, vz, omega_x, omega_y, omega_z

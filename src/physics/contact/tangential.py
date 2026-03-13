@@ -13,7 +13,7 @@ class TangentialParams:
 
 
 class TangentialFriction:
-    """切向接触模型：弹簧 + Tsuji 阻尼 + 黏附摩擦上限。
+    """三维切向接触模型：弹簧 + Tsuji 阻尼 + 黏附摩擦上限。
 
     采用文献中的公式：
     - 切向弹性力: F_ij^{ct} = -k_t δ_t,  k_t = 8 G* a
@@ -31,74 +31,96 @@ class TangentialFriction:
         else:
             self.beta_tsuji = loge / math.sqrt(loge * loge + math.pi * math.pi)
 
-    def force(
+    def force_3d(
         self,
         a: float,
-        delta_t_hist: float,
-        v_rel_t: float,
+        dt_hist_x: float, dt_hist_y: float, dt_hist_z: float,
+        vt_x: float, vt_y: float, vt_z: float,
+        nx: float, ny: float, nz: float,
         dt: float,
         Fn: float,
         F_c: float,
         mu_contact: float,
-    ) -> tuple[float, float]:
-        """计算切向总力与更新后的切向位移历史。
+    ) -> tuple[float, float, float, float, float, float]:
+        """计算三维切向总力与更新后的切向位移历史。
 
         参数:
         - a: 接触半径 a
-        - delta_t_hist: 历史切向位移 δ_t
-        - v_rel_t: 当前切向相对速度 v^t（含转动修正）
+        - dt_hist_x/y/z: 历史切向位移向量 δ_t
+        - vt_x/y/z: 当前切向相对速度向量（含转动修正）
+        - nx/ny/nz: 接触法向单位向量
         - dt: 时间步长
         - Fn: 当前法向力 F_n^t（含黏附与阻尼）
         - F_c: 拉脱力幅值 F_c (>0)
         - mu_contact: 等效质量 m*
 
-        返回: (F_t, new_delta_t_hist)
+        返回: (Ft_x, Ft_y, Ft_z, new_dt_x, new_dt_y, new_dt_z)
         """
 
         if a <= 0.0:
-            return 0.0, delta_t_hist
+            return 0.0, 0.0, 0.0, dt_hist_x, dt_hist_y, dt_hist_z
 
         # 切向刚度 k_t = 8 G* a
         k_t = 8.0 * self.p.G_star * a
         if k_t <= 0.0:
-            return 0.0, delta_t_hist
+            return 0.0, 0.0, 0.0, dt_hist_x, dt_hist_y, dt_hist_z
 
         # 更新切向弹簧位移
-        delta_t = delta_t_hist + v_rel_t * dt
-        F_ct = -k_t * delta_t
+        delta_x = dt_hist_x + vt_x * dt
+        delta_y = dt_hist_y + vt_y * dt
+        delta_z = dt_hist_z + vt_z * dt
 
-        # Tsuji 切向阻尼: F_dt = -η_t v^t,
-        # 其中 η_t = -2 sqrt(5/6) β sqrt(k_t m*)
+        # 重新投影到切平面（消除法向漂移）
+        dot_dn = delta_x * nx + delta_y * ny + delta_z * nz
+        delta_x -= dot_dn * nx
+        delta_y -= dot_dn * ny
+        delta_z -= dot_dn * nz
+
+        # 弹性力
+        Fct_x = -k_t * delta_x
+        Fct_y = -k_t * delta_y
+        Fct_z = -k_t * delta_z
+
+        # Tsuji 切向阻尼
         if self.beta_tsuji != 0.0 and mu_contact > 0.0:
             eta_t = -2.0 * math.sqrt(5.0 / 6.0) * self.beta_tsuji * math.sqrt(k_t * mu_contact)
-            F_dt = -eta_t * v_rel_t
+            Fdt_x = -eta_t * vt_x
+            Fdt_y = -eta_t * vt_y
+            Fdt_z = -eta_t * vt_z
         else:
-            F_dt = 0.0
+            Fdt_x = Fdt_y = Fdt_z = 0.0
 
-        F_trial = F_ct + F_dt
+        F_trial_x = Fct_x + Fdt_x
+        F_trial_y = Fct_y + Fdt_y
+        F_trial_z = Fct_z + Fdt_z
+        F_trial_mag = math.sqrt(F_trial_x * F_trial_x + F_trial_y * F_trial_y + F_trial_z * F_trial_z)
 
         # 黏附摩擦上限：|F_n^t + 2 F_c|
         F_normal_eff = Fn + 2.0 * F_c
         F_limit_static = self.p.MU_S * abs(F_normal_eff)
 
-        if abs(F_trial) <= F_limit_static:
+        if F_trial_mag <= F_limit_static:
             # 静摩擦区：切向弹簧 + 阻尼
-            return F_trial, delta_t
+            return F_trial_x, F_trial_y, F_trial_z, delta_x, delta_y, delta_z
 
-        # 滑动摩擦：F_t = -μ_k |F_n^t + 2F_c| * sign(v_rel)
-        # 摩擦力方向与滑动速度相反
+        # 滑动摩擦
         F_limit_slide = self.p.MU_K * abs(F_normal_eff)
         if F_limit_slide <= 0.0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-        if v_rel_t > 1e-18:
-            v_sign = 1.0
-        elif v_rel_t < -1e-18:
-            v_sign = -1.0
+        v_t_mag = math.sqrt(vt_x * vt_x + vt_y * vt_y + vt_z * vt_z)
+        if v_t_mag > 1e-18:
+            inv_vt = 1.0 / v_t_mag
+            Ft_x = -F_limit_slide * vt_x * inv_vt
+            Ft_y = -F_limit_slide * vt_y * inv_vt
+            Ft_z = -F_limit_slide * vt_z * inv_vt
+            # 将弹簧位移截断在最大静摩擦对应的位置
+            slip_scale = F_limit_static / k_t
+            d_slip_x = -slip_scale * vt_x * inv_vt
+            d_slip_y = -slip_scale * vt_y * inv_vt
+            d_slip_z = -slip_scale * vt_z * inv_vt
         else:
-            v_sign = 0.0
-        Ft = -F_limit_slide * v_sign
+            Ft_x = Ft_y = Ft_z = 0.0
+            d_slip_x = d_slip_y = d_slip_z = 0.0
 
-        # 将弹簧位移截断在最大静摩擦对应的位置，避免无界增长
-        delta_t_slip = -(F_limit_static / k_t) * v_sign
-        return Ft, delta_t_slip
+        return Ft_x, Ft_y, Ft_z, d_slip_x, d_slip_y, d_slip_z

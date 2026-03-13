@@ -4,81 +4,139 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Line3DCollection  # noqa: F401
 
 from ..simulation.particle_system import SystemState
+
+
+def _draw_box_wireframe(ax, Lx: float, Ly: float, Lz: float, **kwargs) -> None:
+    """绘制周期边界盒子的线框。"""
+    hx, hy, hz = 0.5 * Lx, 0.5 * Ly, 0.5 * Lz
+    corners = [
+        (-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+        (-hx, -hy, hz),  (hx, -hy, hz),  (hx, hy, hz),  (-hx, hy, hz),
+    ]
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),  # bottom
+        (4,5),(5,6),(6,7),(7,4),  # top
+        (0,4),(1,5),(2,6),(3,7),  # verticals
+    ]
+    for i0, i1 in edges:
+        xs = [corners[i0][0], corners[i1][0]]
+        ys = [corners[i0][1], corners[i1][1]]
+        zs = [corners[i0][2], corners[i1][2]]
+        ax.plot(xs, ys, zs, **kwargs)
 
 
 class SnapshotSaver:
     def __init__(self, out_dir: str, snapshot_show_velocity: bool = True) -> None:
         self.out_dir = out_dir
         self.snapshot_show_velocity = bool(snapshot_show_velocity)
+        self.vmax_colorbar: float | None = None  # 固定色标上限，首帧自动设定
         os.makedirs(out_dir, exist_ok=True)
 
     def save(self, state: SystemState, t: float, Lx: float, Ly: float, path: str,
-             *, dt_info: str | None = None, max_abs_vn: float | None = None) -> None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.set_aspect('equal')
-        # 绘图轴采用真实边界，保证颗粒完整显示
-        ax.set_xlim(-0.5*Lx, 0.5*Lx)
-        ax.set_ylim(-0.5*Ly, 0.5*Ly)
-        title = f"t = {t:.3e} s"
-        # if max_abs_vn is not None:
-        #     title += f"  |v_n|_max = {max_abs_vn:.2e}"
-        ax.set_title(title)
-        # 用真实半径绘制圆形颗粒（主图层）
-        for xi, yi in zip(state.x, state.y):
-            circ = Circle((xi, yi), radius=state.r, facecolor='tab:blue', edgecolor='black', linewidth=0.3, alpha=0.8)
-            ax.add_patch(circ)
-        # 周期边界的显示平铺：在四周绘制复制影像，保证视觉连续性
-        offsets = [(-Lx, 0.0), (Lx, 0.0), (0.0, -Ly), (0.0, Ly), (-Lx, -Ly), (-Lx, Ly), (Lx, -Ly), (Lx, Ly)]
-        x_min, x_max = -0.5*Lx, 0.5*Lx
-        y_min, y_max = -0.5*Ly, 0.5*Ly
-        for ox, oy in offsets:
-            for xi, yi in zip(state.x, state.y):
-                xcp = xi + ox; ycp = yi + oy
-                if (x_min - state.r) <= xcp <= (x_max + state.r) and (y_min - state.r) <= ycp <= (y_max + state.r):
-                    circ = Circle((xcp, ycp), radius=state.r, facecolor='tab:blue', edgecolor='black', linewidth=0.3, alpha=0.3)
-                    ax.add_patch(circ)
-        # 速度箭头：按 v/vmax 归一化，最大箭头长度约为 2r（增强可见性）
-        if self.snapshot_show_velocity and state.vx is not None and state.vy is not None:
-            vmag = np.hypot(state.vx, state.vy)
-            if vmag.size > 0:
-                vmax = float(np.max(vmag))
-                if vmax > 0.0:
-                    scale_len = 2.0 * state.r
-                    U = scale_len * (state.vx / vmax)
-                    V = scale_len * (state.vy / vmax)
-                    ax.quiver(state.x, state.y, U, V, angles='xy', scale_units='xy', scale=1.0,
-                              color='orange', width=0.004, alpha=0.9)
-        # 标注当前快照中速度最快的颗粒（仅在主域内的原始坐标处标注）
-        if self.snapshot_show_velocity and state.vx is not None and state.vy is not None:
-            vmag = np.hypot(state.vx, state.vy)
-            if vmag.size > 0:
-                imax = int(np.argmax(vmag))
-                x_fast = float(state.x[imax])
-                y_fast = float(state.y[imax])
-                v_fast = float(vmag[imax])
-                # 高亮圈：稍大半径的空心红圈以突出显示
-                highlight = Circle((x_fast, y_fast), radius=state.r*1.15, facecolor='none', edgecolor='red', linewidth=1.8, alpha=0.9)
-                ax.add_patch(highlight)
-                # 在标注点旁打印速度大小
-                ax.annotate(f"v_max = {v_fast:.3e} m/s", xy=(x_fast, y_fast), xytext=(8, 8), textcoords='offset points',
-                            color='red', fontsize=8, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='red', alpha=0.6))
-        # 绘制两层边界：真实边界（淡色）与视觉边界（内缩 r，深色）
-        inset_x_min = -0.5*Lx + state.r
-        inset_x_max =  0.5*Lx - state.r
-        inset_y_min = -0.5*Ly + state.r
-        inset_y_max =  0.5*Ly - state.r
-        ax.add_patch(plt.Rectangle((-0.5*Lx, -0.5*Ly), Lx, Ly, fill=False, color='gray', lw=0.8, alpha=0.6))
-        # ax.add_patch(plt.Rectangle((inset_x_min, inset_y_min), inset_x_max - inset_x_min, inset_y_max - inset_y_min, fill=False, color='k', lw=1.2))
-        ax.grid(True, ls='--', alpha=0.2)
-        # 左下角显示步长信息
+             *, Lz: float | None = None,
+             dt_info: str | None = None, max_abs_vn: float | None = None) -> None:
+        if Lz is None:
+            Lz = max(Lx, Ly)
+
+        fig_inches = 7.0
+        dpi = 150
+        fig = plt.figure(figsize=(fig_inches, fig_inches))
+        ax = fig.add_subplot(111, projection='3d')
+
+        title = f"t = {t:.3e} s  (N={state.size()}, r={state.r:.2e} m)"
+        ax.set_title(title, fontsize=9)
+
+        hx, hy, hz = 0.5 * Lx, 0.5 * Ly, 0.5 * Lz
+        ax.set_xlim(-hx, hx)
+        ax.set_ylim(-hy, hy)
+        ax.set_zlim(-hz, hz)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        # ---------- 计算与物理半径匹配的散点标记大小 ----------
+        # matplotlib scatter 的 s 参数单位是 point²（1 point = 1/72 inch）
+        # 3D 投影下的近似：取主轴范围对应图形有效宽度（约 fig 的 60%）
+        L_max = max(Lx, Ly, Lz)
+        effective_plot_inches = fig_inches * 0.55  # 3D 投影有效绘图区约占图幅 55%
+        points_per_data = (effective_plot_inches * 72.0) / L_max
+        # 散点标记面积 = π * (r_points)² ，其中 r_points = r * points_per_data
+        r_points = state.r * points_per_data
+        marker_area = np.pi * r_points ** 2
+        # 为极端尺寸设置上下限保证可见性
+        marker_area = max(4.0, min(800.0, marker_area))
+
+        # ---------- 绘制粒子 ----------
+        vmag = np.sqrt(state.vx**2 + state.vy**2 + state.vz**2)
+        # 首帧自动锁定色标上限
+        if self.vmax_colorbar is None:
+            self.vmax_colorbar = float(np.max(vmag)) if vmag.size > 0 else 1.0
+            if self.vmax_colorbar <= 0.0:
+                self.vmax_colorbar = 1.0
+        sc = ax.scatter(
+            state.x, state.y, state.z,
+            s=marker_area,
+            c=vmag,
+            cmap='coolwarm',
+            vmin=0.0,
+            vmax=self.vmax_colorbar,
+            edgecolors='k',
+            linewidths=0.3,
+            alpha=0.85,
+            depthshade=True,
+        )
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.55, pad=0.08)
+        cbar.set_label("|v| (m/s)", fontsize=8)
+
+        # ---------- 速度箭头 ----------
+        if self.snapshot_show_velocity and vmag.size > 0:
+            vmax_val = float(np.max(vmag))
+            if vmax_val > 0.0:
+                scale_len = 2.0 * state.r
+                U = scale_len * (state.vx / vmax_val)
+                V = scale_len * (state.vy / vmax_val)
+                W = scale_len * (state.vz / vmax_val)
+                ax.quiver(
+                    state.x, state.y, state.z,
+                    U, V, W,
+                    length=1.0, normalize=False,
+                    color='orange', alpha=0.7, linewidth=0.6, arrow_length_ratio=0.3,
+                )
+
+        # ---------- 标注最快粒子 ----------
+        if self.snapshot_show_velocity and vmag.size > 0:
+            imax = int(np.argmax(vmag))
+            v_fast = float(vmag[imax])
+            ax.scatter(
+                [state.x[imax]], [state.y[imax]], [state.z[imax]],
+                s=marker_area * 2.5,
+                facecolors='none', edgecolors='red', linewidths=1.8,
+                depthshade=False,
+            )
+            ax.text(
+                float(state.x[imax]), float(state.y[imax]), float(state.z[imax]),
+                f"  v_max={v_fast:.2e}",
+                fontsize=7, color='red',
+            )
+
+        # ---------- 盒子线框 ----------
+        _draw_box_wireframe(ax, Lx, Ly, Lz, color='gray', lw=0.6, alpha=0.5)
+
+        # ---------- 步长信息与粒子半径标注 ----------
+        info_parts = []
         if dt_info:
-            ax.text(0.02, 0.02, dt_info, transform=ax.transAxes,
-                    fontsize=8, color='purple', va='bottom', ha='left',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='purple', alpha=0.7))
+            info_parts.append(dt_info)
+        # info_parts.append(f"r={state.r:.2e} m, 2r={2*state.r:.2e} m")
+        ax.text2D(0.02, 0.02, "\n".join(info_parts), transform=ax.transAxes,
+                  fontsize=7, color='purple', va='bottom', ha='left',
+                  bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='purple', alpha=0.7))
+
+        ax.set_box_aspect([Lx, Ly, Lz])
+
         fig.tight_layout()
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=dpi)
         plt.close(fig)

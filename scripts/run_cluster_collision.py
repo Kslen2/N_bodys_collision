@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     # B 团簇质心速度
     p.add_argument("--vxB", type=float, default=None, help="Initial x-velocity of cluster B (override YAML, m/s)")
     p.add_argument("--vyB", type=float, default=None, help="Initial y-velocity of cluster B (override YAML, m/s)")
+    p.add_argument("--vzB", type=float, default=None, help="Initial z-velocity of cluster B (override YAML, m/s)")
     # 运行与输出控制
     p.add_argument("--t_end", type=float, default=None, help="Override total simulation time (s)")
     p.add_argument("--snapshot_interval", type=float, default=None, help="Override snapshot interval (s)")
@@ -90,16 +91,18 @@ def _run_two_body_with_detection(
 
         dx = float(runner.state.x[iB] - runner.state.x[iA])
         dy = float(runner.state.y[iB] - runner.state.y[iA])
-        dx, dy = runner._minimal_image(dx, dy)  # type: ignore[attr-defined]
-        d = math.sqrt(dx * dx + dy * dy)
+        dz = float(runner.state.z[iB] - runner.state.z[iA])
+        dx, dy, dz = runner._minimal_image(dx, dy, dz)
+        d = math.sqrt(dx * dx + dy * dy + dz * dz)
         if d <= 1e-18:
-            # 极端重合情况下，法向方向不确定，返回 0
             return d, 0.0
         nx = dx / d
         ny = dy / d
+        nz = dz / d
         dvx = float(runner.state.vx[iB] - runner.state.vx[iA])
         dvy = float(runner.state.vy[iB] - runner.state.vy[iA])
-        v_rel_n = dvx * nx + dvy * ny
+        dvz = float(runner.state.vz[iB] - runner.state.vz[iA])
+        v_rel_n = dvx * nx + dvy * ny + dvz * nz
         return d, v_rel_n
 
     snap_dt = float(sim_params.snapshot_interval or 0.0)
@@ -117,10 +120,11 @@ def _run_two_body_with_detection(
             runner.Lx,
             runner.Ly,
             os.path.join(sim_params.snapshot_dir, "snap_000000_t0.000e+00.png"),
+            Lz=runner.Lz,
             dt_info=dt_info,
         )
         KE_t0, KE_r0, KE_sum0 = _energies(runner)
-        vmax0 = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
+        vmax0 = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2 + runner.state.vz ** 2)))
         cluster_count0, coord_mean0, rg_mean0 = runner._cluster_metrics()
         runner.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
 
@@ -161,7 +165,7 @@ def _run_two_body_with_detection(
                 break
 
         # 计算受力并推进一步
-        fx, fy, tau, _max_abs_vn, _min_approach = runner._compute_forces()
+        fx, fy, fz, tau_x, tau_y, tau_z, _max_abs_vn, _min_approach = runner._compute_forces()
 
         # 快照与能量报告（与 DEMSimulator.run 的顺序保持一致：在积分前写出当前时刻）
         if t >= next_snap:
@@ -173,15 +177,16 @@ def _run_two_body_with_detection(
                 runner.Lx,
                 runner.Ly,
                 os.path.join(sim_params.snapshot_dir, fname),
+                Lz=runner.Lz,
                 dt_info=dt_info,
             )
             KE_t, KE_r, KE_sum = _energies(runner)
-            vmax = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
+            vmax = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2 + runner.state.vz ** 2)))
             cluster_count, coord_mean, rg_mean = runner._cluster_metrics()
             runner.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
             next_snap += snap_dt
 
-        runner._integrate(fx, fy, tau)
+        runner._integrate(fx, fy, fz, tau_x, tau_y, tau_z)
         runner._apply_periodic_wrap()
 
         t += sim_params.dt
@@ -206,10 +211,11 @@ def _run_two_body_with_detection(
         runner.Lx,
         runner.Ly,
         os.path.join(sim_params.snapshot_dir, "final_snapshot.png"),
+        Lz=runner.Lz,
         dt_info=dt_info,
     )
     KE_tf, KE_rf, KE_sumf = _energies(runner)
-    vmaxf = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2)))
+    vmaxf = float(np.max(np.sqrt(runner.state.vx ** 2 + runner.state.vy ** 2 + runner.state.vz ** 2)))
     cluster_countf, coord_meanf, rg_meanf = runner._cluster_metrics()
     runner.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf, cluster_countf, coord_meanf, rg_meanf)
     elapsed = time.perf_counter() - start_time
@@ -272,19 +278,23 @@ def _simulate_two_body_case(
         z_target=base_cluster.z_target,
         vx_B=float(vxB),
         vy_B=float(vyB),
+        vz_B=float(getattr(base_cluster, 'vz_B', 0.0)),
     )
 
-    x, y, vx, vy, omega = initialize_two_clusters(cluster_params, materials.r)
+    x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_two_clusters(cluster_params, materials.r)
     mass = materials.mass
-    state = SystemState(x=x, y=y, vx=vx, vy=vy, omega=omega, mass=mass, r=materials.r)
+    state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+                        omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
+                        mass=mass, r=materials.r)
 
-    # 盒子大小：按当前粒子包围盒估算并留出裕量
     x_min = float(np.min(x)); x_max = float(np.max(x))
     y_min = float(np.min(y)); y_max = float(np.max(y))
-    span_x = x_max - x_min; span_y = y_max - y_min
+    z_min = float(np.min(z)); z_max = float(np.max(z))
+    span_x = x_max - x_min; span_y = y_max - y_min; span_z = z_max - z_min
     margin = 10.0 * float(materials.r)
     Lx = max(span_x + margin, 20.0 * float(materials.r))
     Ly = max(span_y + margin, 20.0 * float(materials.r))
+    Lz = max(span_z + margin, 20.0 * float(materials.r))
 
     snapshot_dir = os.path.abspath(sim_cfg.get("snapshot_dir", "data/cluster_collision"))
 
@@ -298,6 +308,7 @@ def _simulate_two_body_case(
         domain_scale=1.0,
         Lx=Lx,
         Ly=Ly,
+        Lz=Lz,
         use_numba=bool(sim_cfg.get("use_numba", False)),
         use_numba_parallel=bool(sim_cfg.get("use_numba_parallel", False)),
         snapshot_show_velocity=False,
@@ -321,16 +332,17 @@ def _simulate_two_body_case(
     iA, iB = 0, 1
 
     def _relative_geom_and_vn() -> tuple[float, float]:
-        # 扫描模式下不使用周期最小镜像，直接在物理空间计算相对几何量
         dx = float(runner.state.x[iB] - runner.state.x[iA])
         dy = float(runner.state.y[iB] - runner.state.y[iA])
-        d = math.sqrt(dx * dx + dy * dy)
+        dz = float(runner.state.z[iB] - runner.state.z[iA])
+        d = math.sqrt(dx * dx + dy * dy + dz * dz)
         if d <= 1e-18:
             return d, 0.0
-        nx = dx / d; ny = dy / d
+        nx = dx / d; ny = dy / d; nz = dz / d
         dvx = float(runner.state.vx[iB] - runner.state.vx[iA])
         dvy = float(runner.state.vy[iB] - runner.state.vy[iA])
-        v_rel_n = dvx * nx + dvy * ny
+        dvz = float(runner.state.vz[iB] - runner.state.vz[iA])
+        v_rel_n = dvx * nx + dvy * ny + dvz * nz
         return d, v_rel_n
 
     t = 0.0
@@ -343,6 +355,7 @@ def _simulate_two_body_case(
     # 若粒子在尚未发生碰撞前离开边界，则视为“未碰撞”并提前结束。
     half_x = 0.5 * runner.Lx
     half_y = 0.5 * runner.Ly
+    half_z = 0.5 * runner.Lz
 
     while t < sim_params.t_end:
         d, v_rel_n = _relative_geom_and_vn()
@@ -365,16 +378,16 @@ def _simulate_two_body_case(
                 event_vn = 0.0
                 break
 
-        fx, fy, tau, _max_abs_vn, _min_approach = runner._compute_forces()
-        runner._integrate(fx, fy, tau)
+        fx, fy, fz, tau_x, tau_y, tau_z, _max_abs_vn, _min_approach = runner._compute_forces()
+        runner._integrate(fx, fy, fz, tau_x, tau_y, tau_z)
 
-        # 边界判定：不开启周期边界，若尚未发生碰撞且粒子越界，则视为未碰撞
         if not has_collided:
-            out_x_low = np.any(runner.state.x < -half_x)
-            out_x_high = np.any(runner.state.x > half_x)
-            out_y_low = np.any(runner.state.y < -half_y)
-            out_y_high = np.any(runner.state.y > half_y)
-            if out_x_low or out_x_high or out_y_low or out_y_high:
+            out_of_bounds = (
+                np.any(runner.state.x < -half_x) or np.any(runner.state.x > half_x) or
+                np.any(runner.state.y < -half_y) or np.any(runner.state.y > half_y) or
+                np.any(runner.state.z < -half_z) or np.any(runner.state.z > half_z)
+            )
+            if out_of_bounds:
                 status = "no_collision"
                 event_vn = None
                 break
@@ -543,9 +556,9 @@ def _scan_velocity_heatmap(
 
 def _energies(runner: DEMSimulator) -> tuple[float, float, float]:
     m = runner.state.mass
-    KE_trans = 0.5 * m * float(np.sum(runner.state.vx ** 2 + runner.state.vy ** 2))
+    KE_trans = 0.5 * m * float(np.sum(runner.state.vx ** 2 + runner.state.vy ** 2 + runner.state.vz ** 2))
     I = 0.4 * m * (runner.state.r ** 2)
-    KE_rot = 0.5 * I * float(np.sum(runner.state.omega ** 2))
+    KE_rot = 0.5 * I * float(np.sum(runner.state.omega_x ** 2 + runner.state.omega_y ** 2 + runner.state.omega_z ** 2))
     return KE_trans, KE_rot, KE_trans + KE_rot
 
 
@@ -772,6 +785,7 @@ def main() -> None:
     z_target_val = float(cluster_cfg.get("z_target", 2.0))
     vxB_val = _get_float("vxB", args.vxB, cluster_cfg, "vxB", -1.0)
     vyB_val = _get_float("vyB", args.vyB, cluster_cfg, "vyB", 0.0)
+    vzB_val = _get_float("vzB", getattr(args, 'vzB', None), cluster_cfg, "vzB", 0.0)
 
     cluster_params = ClusterInitParams(
         N1=N1_val,
@@ -781,6 +795,7 @@ def main() -> None:
         z_target=z_target_val,
         vx_B=vxB_val,
         vy_B=vyB_val,
+        vz_B=vzB_val,
     )
 
     # ----- 仿真时间参数（供单次 & 扫描共用）-----
@@ -799,20 +814,26 @@ def main() -> None:
             return
 
     # ----- 常规模拟：初始化两团簇并建立系统状态 -----
-    x, y, vx, vy, omega = initialize_two_clusters(cluster_params, materials.r)
+    x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_two_clusters(cluster_params, materials.r)
     mass = materials.mass
-    state = SystemState(x=x, y=y, vx=vx, vy=vy, omega=omega, mass=mass, r=materials.r)
+    state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+                        omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
+                        mass=mass, r=materials.r)
 
     # ----- 盒子大小：按当前粒子包围盒估算并留出裕量 -----
     x_min = float(np.min(x))
     x_max = float(np.max(x))
     y_min = float(np.min(y))
     y_max = float(np.max(y))
+    z_min = float(np.min(z))
+    z_max = float(np.max(z))
     span_x = x_max - x_min
     span_y = y_max - y_min
+    span_z = z_max - z_min
     margin = 10.0 * float(materials.r)
     Lx = max(span_x + margin, 20.0 * float(materials.r))
     Ly = max(span_y + margin, 20.0 * float(materials.r))
+    Lz = max(span_z + margin, 20.0 * float(materials.r))
 
     # ----- 仿真参数 -----
     snapshot_interval = (
@@ -839,6 +860,7 @@ def main() -> None:
         domain_scale=1.0,
         Lx=Lx,
         Ly=Ly,
+        Lz=Lz,
         use_numba=bool(sim_cfg.get("use_numba", args.numba)),
         use_numba_parallel=bool(sim_cfg.get("use_numba_parallel", False)),
         snapshot_show_velocity=bool(sim_cfg.get("snapshot_show_velocity", True)),

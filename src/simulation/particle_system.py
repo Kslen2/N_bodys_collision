@@ -7,9 +7,13 @@ import numpy as np
 class SystemState:
     x: np.ndarray
     y: np.ndarray
+    z: np.ndarray
     vx: np.ndarray
     vy: np.ndarray
-    omega: np.ndarray
+    vz: np.ndarray
+    omega_x: np.ndarray
+    omega_y: np.ndarray
+    omega_z: np.ndarray
     mass: float
     r: float
 

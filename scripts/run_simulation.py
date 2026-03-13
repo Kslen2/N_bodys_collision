@@ -44,9 +44,11 @@ def main() -> None:
         N=int(ini["N"]), h=float(ini["h"]), vmin=float(ini["vmin"]), vmax=float(ini["vmax"]), seed=int(ini.get("seed", 0))
     )
 
-    x, y, vx, vy, omega = initialize_grid(init_params, materials.r)
+    x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_grid(init_params, materials.r)
     mass = materials.mass
-    state = SystemState(x=x, y=y, vx=vx, vy=vy, omega=omega, mass=mass, r=materials.r)
+    state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+                        omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
+                        mass=mass, r=materials.r)
 
     # 盒子严格设为 N*h（可用 domain_scale 额外缩放，默认 1.0）
     L = float(init_params.N) * float(init_params.h) * float(sim.get("domain_scale", 1.0))
@@ -54,7 +56,7 @@ def main() -> None:
         dt=float(sim["dt"]), t_end=float(sim["t_end"]), skin_factor=float(sim.get("skin_factor", 0.2)),
         snapshot_interval=float(sim.get("snapshot_interval", 0.0)), save_stride=int(sim.get("save_stride", 1)),
         snapshot_dir=str(sim.get("snapshot_dir", "data/snapshot_saver")), domain_scale=float(sim.get("domain_scale", 1.0)),
-        Lx=L, Ly=L,
+        Lx=L, Ly=L, Lz=L,
         use_numba=bool(sim.get("use_numba", args.numba)),
         use_numba_parallel=bool(sim.get("use_numba_parallel", False)),
         snapshot_show_velocity=bool(sim.get("snapshot_show_velocity", True)),

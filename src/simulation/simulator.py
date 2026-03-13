@@ -61,6 +61,7 @@ class SimParams:
     domain_scale: float = 1.0
     Lx: float | None = None
     Ly: float | None = None
+    Lz: float | None = None
     # 是否启用 Numba 加速（需安装 numba）
     use_numba: bool = False
     # 是否启用 Numba 多线程并行（prange）
@@ -92,17 +93,19 @@ class DEMSimulator:
         self.mat = materials
         self.sim = sim
         self.state = state
-        # domain: 优先使用外部传入的 Lx/Ly，否则按位置估算并乘以 domain_scale
-        if (self.sim.Lx is not None) and (self.sim.Ly is not None):
+        # domain: 优先使用外部传入的 Lx/Ly/Lz，否则按位置估算并乘以 domain_scale
+        if (self.sim.Lx is not None) and (self.sim.Ly is not None) and (self.sim.Lz is not None):
             self.Lx = float(self.sim.Lx)
             self.Ly = float(self.sim.Ly)
+            self.Lz = float(self.sim.Lz)
         else:
             L_est = self._estimate_box_length()
             self.Lx = self.sim.domain_scale * L_est
             self.Ly = self.sim.domain_scale * L_est
-        # neighbor/search（需已知 Lx/Ly）
+            self.Lz = self.sim.domain_scale * L_est
+        # neighbor/search（需已知 Lx/Ly/Lz）
         self.skin = float(sim.skin_factor) * self.mat.r
-        self.neigh = NeighborParams(r=self.mat.r, skin=self.skin, cell_size=None, Lx=self.Lx, Ly=self.Ly)
+        self.neigh = NeighborParams(r=self.mat.r, skin=self.skin, cell_size=None, Lx=self.Lx, Ly=self.Ly, Lz=self.Lz)
         # contact models
         self.jkr = JKRNormal(JKRParams(E_star=self.mat.E_star, gamma=self.mat.gamma, r=self.mat.r, e_n=self.mat.e_n))
         # 根据配置选择是否在 JKR 模型中使用插值近似
@@ -148,9 +151,9 @@ class DEMSimulator:
         # histories
         # 迁移：为减少 Python 热路径开销，优先使用与邻域缓存对齐的数组映射
         # 当未启用邻域缓存时，仍保留字典以保持兼容
-        self.tangential_hist: Dict[Tuple[int,int], float] = {}
+        self.tangential_hist: Dict[Tuple[int,int], np.ndarray] = {}  # key -> [dt_x, dt_y, dt_z]
         self.contact_started: Dict[Tuple[int,int], bool] = {}
-        self._pair_hist: np.ndarray | None = None         # 与 _nbr_pairs 对齐的切向历史
+        self._pair_hist: np.ndarray | None = None         # 与 _nbr_pairs 对齐的切向历史 (m*3,)
         self._pair_started_arr: np.ndarray | None = None  # 与 _nbr_pairs 对齐的接触标记（0/1 浮点）
         self._pair_index: Dict[Tuple[int,int], int] = {}  # (min(i,j), max(i,j)) -> 索引
         # outputs
@@ -163,6 +166,7 @@ class DEMSimulator:
         self._nbr_pairs: List[Tuple[int, int]] | None = None
         self._nbr_ref_x: np.ndarray | None = None
         self._nbr_ref_y: np.ndarray | None = None
+        self._nbr_ref_z: np.ndarray | None = None
         self._nbr_rebuild_count: int = 0
         self._nbr_query_steps: int = 0
         # 选择后端（仅输出一次）
@@ -180,7 +184,7 @@ class DEMSimulator:
         self._adaptive_dt_max_factor = max(self._adaptive_dt_min_factor, float(getattr(self.sim, "adaptive_dt_max_factor", 50.0)))
         self._adaptive_vmax_ema_alpha = float(getattr(self.sim, "adaptive_vmax_ema_alpha", 0.2))
         self._adaptive_vmax_ema_alpha = min(max(self._adaptive_vmax_ema_alpha, 0.0), 1.0)
-        v_abs0 = np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)
+        v_abs0 = np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy + self.state.vz * self.state.vz)
         self._vmax_init = max(float(np.max(v_abs0)), 1e-30)
         self._vmax_approx = self._vmax_init
         self._adaptive_factor_sum = 0.0
@@ -201,6 +205,7 @@ class DEMSimulator:
         self._nb_j_idx = None
         self._nb_dx = None
         self._nb_dy = None
+        self._nb_dz = None
         self._nb_d = None
         self._nb_hist_in = None
         self._nb_started_in = None
@@ -210,14 +215,14 @@ class DEMSimulator:
             return
         if m <= self._nbuf_capacity:
             return
-        # 以 1.5x 增长，减少频繁扩容
         new_cap = int(max(8, _math.ceil(m * 1.5)))
         self._nb_i_idx = np.empty(new_cap, dtype=np.int64)
         self._nb_j_idx = np.empty(new_cap, dtype=np.int64)
         self._nb_dx = np.empty(new_cap, dtype=np.float64)
         self._nb_dy = np.empty(new_cap, dtype=np.float64)
+        self._nb_dz = np.empty(new_cap, dtype=np.float64)
         self._nb_d = np.empty(new_cap, dtype=np.float64)
-        self._nb_hist_in = np.empty(new_cap, dtype=np.float64)
+        self._nb_hist_in = np.empty(new_cap * 3, dtype=np.float64)
         self._nb_started_in = np.empty(new_cap, dtype=np.float64)
         self._nbuf_capacity = new_cap
 
@@ -225,10 +230,11 @@ class DEMSimulator:
     # 邻域缓存（Verlet 邻居）
     # ------------------------------
 
-    def _minimal_image(self, dx: float, dy: float) -> Tuple[float, float]:
-        """2D 周期最小镜像位移，假定坐标已包裹到 [-L/2, L/2)。"""
+    def _minimal_image(self, dx: float, dy: float, dz: float) -> Tuple[float, float, float]:
+        """三维周期最小镜像位移。"""
         half_x = 0.5 * self.Lx
         half_y = 0.5 * self.Ly
+        half_z = 0.5 * self.Lz
         if dx > half_x:
             dx -= self.Lx
         elif dx < -half_x:
@@ -237,61 +243,55 @@ class DEMSimulator:
             dy -= self.Ly
         elif dy < -half_y:
             dy += self.Ly
-        return dx, dy
+        if dz > half_z:
+            dz -= self.Lz
+        elif dz < -half_z:
+            dz += self.Lz
+        return dx, dy, dz
 
     def _rebuild_neighbor_pairs(self) -> None:
-        """重建邻接对并更新参考坐标。
-
-        使用现有的 find_contacts / find_contacts_numba 构建一次宽邻居表，
-        只缓存 (i, j) 索引，几何信息在后续每步基于当前坐标重新计算。
-        """
+        """重建邻接对并更新参考坐标（三维）。"""
         n = self.state.size()
         if n == 0:
             self._nbr_pairs = []
             self._nbr_ref_x = None
             self._nbr_ref_y = None
+            self._nbr_ref_z = None
             return
 
-        # 统计重建次数
         self._nbr_rebuild_count += 1
 
         _use_adaptive = bool(getattr(self.sim, "use_adaptive_grid", False))
         if _NUMBA_AVAILABLE and bool(getattr(self.sim, "use_numba", False)):
             use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
             if _use_adaptive:
-                raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel)
             else:
-                raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel)
         else:
             if _use_adaptive:
-                raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.neigh)
+                raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.state.z, self.neigh)
             else:
-                raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
+                raw_pairs = find_contacts(self.state.x, self.state.y, self.state.z, self.neigh)
 
-        # 只缓存索引对，避免保存过期的几何信息
-        # 按 (i, j) 排序，确保 Python/Numba 两条路径的力累加顺序一致，
-        # 消除浮点加法非结合律导致的混沌发散差异。
         new_pairs = sorted(
-            [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs],
+            [(int(i), int(j)) for (i, j, _dx, _dy, _dz, _d) in raw_pairs],
             key=lambda p: (p[0], p[1]),
         )
         old_pairs = self._nbr_pairs or []
         old_hist = self._pair_hist
         old_started = self._pair_started_arr
-        # 构建旧映射以便迁移历史
         old_map: Dict[Tuple[int,int], int] = {}
         if old_pairs:
             for idx, (pi, pj) in enumerate(old_pairs):
                 key = (pi, pj) if pi < pj else (pj, pi)
                 old_map[key] = idx
-        # 更新缓存与参考坐标
         self._nbr_pairs = new_pairs
-        # 记录参考坐标（上次构建邻居表时的位置）
         self._nbr_ref_x = self.state.x.copy()
         self._nbr_ref_y = self.state.y.copy()
-        # 重建数组映射并迁移历史
+        self._nbr_ref_z = self.state.z.copy()
         m = len(new_pairs)
-        self._pair_hist = np.zeros(m, dtype=np.float64)
+        self._pair_hist = np.zeros(m * 3, dtype=np.float64)  # 3 components per pair
         self._pair_started_arr = np.zeros(m, dtype=np.float64)
         self._pair_index.clear()
         for k, (i, j) in enumerate(new_pairs):
@@ -300,53 +300,47 @@ class DEMSimulator:
             if old_hist is not None and old_started is not None:
                 old_k = old_map.get(key, -1)
                 if old_k >= 0:
-                    self._pair_hist[k] = float(old_hist[old_k])
+                    self._pair_hist[k*3]   = float(old_hist[old_k*3])
+                    self._pair_hist[k*3+1] = float(old_hist[old_k*3+1])
+                    self._pair_hist[k*3+2] = float(old_hist[old_k*3+2])
                     self._pair_started_arr[k] = float(old_started[old_k])
 
     def _get_neighbor_pairs(self) -> List[Tuple[int, int]]:
-        """返回当前步可用的邻接对 (i, j)，按最大位移判断是否需要重建。
-
-        使用 skin 作为 Verlet 皮肤：当粒子相对上次重建的最大位移
-        超过 skin/2 时，重建邻居表。
-        """
+        """返回当前步可用的邻接对 (i, j)，按最大位移判断是否需要重建（三维）。"""
         n = self.state.size()
         if n == 0:
             return []
 
-        # 若未开启邻域缓存，退化为每步完整重建
         if not bool(getattr(self.sim, "use_neighbor_cache", False)):
             _use_adaptive = bool(getattr(self.sim, "use_adaptive_grid", False))
             if _NUMBA_AVAILABLE and bool(getattr(self.sim, "use_numba", False)):
                 use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
                 if _use_adaptive:
-                    raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                    raw_pairs = find_contacts_numba_adaptive(self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel)
                 else:
-                    raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.neigh, use_parallel=use_parallel)
+                    raw_pairs = find_contacts_numba(self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel)
             else:
                 if _use_adaptive:
-                    raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.neigh)
+                    raw_pairs = find_contacts_adaptive(self.state.x, self.state.y, self.state.z, self.neigh)
                 else:
-                    raw_pairs = find_contacts(self.state.x, self.state.y, self.neigh)
+                    raw_pairs = find_contacts(self.state.x, self.state.y, self.state.z, self.neigh)
             return sorted(
-                [(int(i), int(j)) for (i, j, _dx, _dy, _d) in raw_pairs],
+                [(int(i), int(j)) for (i, j, _dx, _dy, _dz, _d) in raw_pairs],
                 key=lambda p: (p[0], p[1]),
             )
 
         need_rebuild = False
-        if self._nbr_pairs is None or self._nbr_ref_x is None or self._nbr_ref_y is None:
+        if self._nbr_pairs is None or self._nbr_ref_x is None or self._nbr_ref_y is None or self._nbr_ref_z is None:
             need_rebuild = True
         elif self._nbr_ref_x.shape[0] != n:
-            # 粒子数发生变化，必须重建
             need_rebuild = True
         else:
-            # 检查最大位移
             dx = self.state.x - self._nbr_ref_x
             dy = self.state.y - self._nbr_ref_y
-            max_disp2 = float(np.max(dx * dx + dy * dy))
-            # 使用 skin/2 作为安全阈值（Verlet 标准）
+            dz = self.state.z - self._nbr_ref_z
+            max_disp2 = float(np.max(dx * dx + dy * dy + dz * dz))
             thresh = 0.5 * float(self.skin)
             if thresh <= 0.0:
-                # 若未配置 skin，则每步重建，退化为原行为
                 need_rebuild = True
             else:
                 need_rebuild = (max_disp2 >= (thresh * thresh))
@@ -354,7 +348,6 @@ class DEMSimulator:
         if need_rebuild:
             self._rebuild_neighbor_pairs()
 
-        # 统计查询步数
         self._nbr_query_steps += 1
         return self._nbr_pairs or []
 
@@ -366,22 +359,27 @@ class DEMSimulator:
         def _numba_build_geometry_from_idx(
             x: np.ndarray,
             y: np.ndarray,
+            z: np.ndarray,
             Lx: float,
             Ly: float,
+            Lz: float,
             i_idx: np.ndarray,
             j_idx: np.ndarray,
             dx_arr: np.ndarray,
             dy_arr: np.ndarray,
+            dz_arr: np.ndarray,
             d_arr: np.ndarray,
         ) -> None:
-            """根据 (i,j) 索引，在 Numba 内部计算 dx, dy, d（含周期最小镜像）。"""
+            """根据 (i,j) 索引，在 Numba 内部计算 dx, dy, dz, d（含周期最小镜像）。"""
             m = i_idx.size
             half_x = 0.5 * Lx
             half_y = 0.5 * Ly
+            half_z = 0.5 * Lz
             for k in range(m):
                 i = int(i_idx[k]); j = int(j_idx[k])
                 dx = x[j] - x[i]
                 dy = y[j] - y[i]
+                dz = z[j] - z[i]
                 if dx > half_x:
                     dx -= Lx
                 elif dx < -half_x:
@@ -390,9 +388,14 @@ class DEMSimulator:
                     dy -= Ly
                 elif dy < -half_y:
                     dy += Ly
+                if dz > half_z:
+                    dz -= Lz
+                elif dz < -half_z:
+                    dz += Lz
                 dx_arr[k] = dx
                 dy_arr[k] = dy
-                d_arr[k] = _math.sqrt(dx * dx + dy * dy)
+                dz_arr[k] = dz
+                d_arr[k] = _math.sqrt(dx * dx + dy * dy + dz * dz)
 
         @_njit(cache=True)
         def _numba_force_kernel(
@@ -401,10 +404,14 @@ class DEMSimulator:
             j_idx: np.ndarray,
             dx_arr: np.ndarray,
             dy_arr: np.ndarray,
+            dz_arr: np.ndarray,
             d_arr: np.ndarray,
             vx: np.ndarray,
             vy: np.ndarray,
-            omega: np.ndarray,
+            vz: np.ndarray,
+            omega_x: np.ndarray,
+            omega_y: np.ndarray,
+            omega_z: np.ndarray,
             r: float,
             mass: float,
             E_star: float,
@@ -424,20 +431,23 @@ class DEMSimulator:
             dalpha: float,
             a_tab: np.ndarray,
             F_tab: np.ndarray,
-        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
+                    np.ndarray, np.ndarray, np.ndarray,
+                    np.ndarray, np.ndarray,
                     float, float]:
             fx = np.zeros(n)
             fy = np.zeros(n)
-            tau = np.zeros(n)
-            hist_out = np.empty(i_idx.size)
+            fz = np.zeros(n)
+            tau_x = np.zeros(n)
+            tau_y = np.zeros(n)
+            tau_z = np.zeros(n)
+            hist_out = np.empty(i_idx.size * 3)
             contacts_mask = np.zeros(i_idx.size)
-            # 自适应步长追踪量（在力循环中顺手计算，零额外开销）
-            max_abs_vn = 0.0          # 所有接触对中最大 |v_n|
-            min_approach_time = 1e30  # 所有未接触近邻对的最小碰撞接近时间
+            max_abs_vn = 0.0
+            min_approach_time = 1e30
             mu_eff = 0.5 * mass
             R_eff = 0.5 * r
 
-            # 预先计算 Tsuji 系数与 EDEM 标准拉脱力
             e_n_clamped = e_n
             if e_n_clamped < 1.0e-4:
                 e_n_clamped = 1.0e-4
@@ -449,54 +459,59 @@ class DEMSimulator:
             else:
                 beta_tsuji = 0.0
 
-            # EDEM 标准：F_c = (3/2)πΓR*
             F_c = 1.5 * _math.pi * gamma * R_eff
-
-            # 平衡接触半径 a0 = (9πΓR*²/E*)^(1/3)
             a0 = ((9.0 * _math.pi * gamma * R_eff * R_eff) / E_star) ** (1.0 / 3.0)
-
-            # 临界重叠量 α_f = (3F_c²/(16R*E*²))^(1/3)
             alpha_f = ((3.0 * F_c * F_c) / (16.0 * R_eff * E_star * E_star)) ** (1.0 / 3.0)
-
-            # 系数 2πΓ/E* 用于隐式公式
             coeff_alpha = 2.0 * _math.pi * gamma / E_star
-
-            # 等效剪切模量 G*，与 Materials.G_star 一致：G* = E / (4 (2-ν) (1+ν))
-            # 由 E_star 反解 E（相同材料、相同半径粒子）: E = 2 E* (1-ν^2)
             E_equiv = 2.0 * E_star * (1.0 - nu * nu)
             G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
+
             for k in range(i_idx.size):
                 i = int(i_idx[k]); j = int(j_idx[k])
-                dxk = dx_arr[k]; dyk = dy_arr[k]; dk = d_arr[k]
-                nx = dxk / (dk + 1e-18)
-                ny = dyk / (dk + 1e-18)
-                tx = -ny; ty = nx
+                dxk = dx_arr[k]; dyk = dy_arr[k]; dzk = dz_arr[k]; dk = d_arr[k]
+                inv_d = 1.0 / (dk + 1e-18)
+                nx = dxk * inv_d
+                ny = dyk * inv_d
+                nz = dzk * inv_d
                 delta_n = 2.0 * r - dk
-                v_rel_n = (vx[j] - vx[i]) * nx + (vy[j] - vy[i]) * ny
-                v_rel_t = (vx[j] - vx[i]) * tx + (vy[j] - vy[i]) * ty
-                # 接触点滑动速度：v_slip = v_rel - r*(ω_i + ω_j)*t
-                v_rel_t_eff = v_rel_t - r * (omega[i] + omega[j])
+
+                # 相对速度
+                dvx = vx[j] - vx[i]
+                dvy = vy[j] - vy[i]
+                dvz = vz[j] - vz[i]
+                v_rel_n = dvx * nx + dvy * ny + dvz * nz
+
+                # 接触点相对速度 = v_rel - r*(ω_i + ω_j) × n
+                # ω × n 分量
+                wx = omega_x[i] + omega_x[j]
+                wy = omega_y[i] + omega_y[j]
+                wz = omega_z[i] + omega_z[j]
+                # cross(w, n) = (wy*nz - wz*ny, wz*nx - wx*nz, wx*ny - wy*nx)
+                cross_x = wy * nz - wz * ny
+                cross_y = wz * nx - wx * nz
+                cross_z = wx * ny - wy * nx
+
+                # 切向相对速度 = v_rel - v_n*n - r*(ω_i+ω_j)×n
+                vt_x = dvx - v_rel_n * nx - r * cross_x
+                vt_y = dvy - v_rel_n * ny - r * cross_y
+                vt_z = dvz - v_rel_n * nz - r * cross_z
+
                 started = started_in[k] > 0.5
 
-                # --- 自适应步长追踪 ---
                 if delta_n > 0.0 or started:
-                    # 接触对：追踪最大 |v_n|——用 max() 保证 prange 归约被识别
                     max_abs_vn = max(max_abs_vn, abs(v_rel_n))
                 else:
-                    # 未接触对：计算接近时间预警
                     v_approach = -v_rel_n
                     if v_approach > 1e-18:
-                        gap = dk - 2.0 * r  # > 0
+                        gap = dk - 2.0 * r
                         t_contact = gap / v_approach
                         min_approach_time = min(min_approach_time, t_contact)
 
                 # ========== EDEM 标准 JKR 法向力 ==========
-                # 可选：使用插值表近似 F_elastic 与 a_contact，否则回退牛顿迭代。
                 Fn = 0.0
-                a_contact = 0.0  # 接触半径，用于切向力计算
+                a_contact = 0.0
 
                 if delta_n > -alpha_f:
-                    # 未接触且无黏附历史，不计算力
                     if delta_n < 0.0 and (not started):
                         Fn = 0.0
                         a_contact = 0.0
@@ -504,7 +519,6 @@ class DEMSimulator:
                         F_elastic = 0.0
                         used_interp = False
                         if use_interp == 1:
-                            # 插值区间内：线性插值 a(α), F_elastic(α)
                             if (delta_n > alpha_min) and (delta_n < alpha_max):
                                 t_alpha = (delta_n - alpha_min) / dalpha
                                 idx = int(t_alpha)
@@ -517,18 +531,13 @@ class DEMSimulator:
                                     frac = 1.0
                                 else:
                                     frac = t_alpha - idx
-                                a0_tab = a_tab[idx]
-                                a1_tab = a_tab[idx + 1]
-                                F0_tab = F_tab[idx]
-                                F1_tab = F_tab[idx + 1]
-                                a_interp = a0_tab + (a1_tab - a0_tab) * frac
-                                F_elastic = F0_tab + (F1_tab - F0_tab) * frac
+                                a_interp = a_tab[idx] + (a_tab[idx + 1] - a_tab[idx]) * frac
+                                F_elastic = F_tab[idx] + (F_tab[idx + 1] - F_tab[idx]) * frac
                                 if a_interp > 0.0 and F_elastic != 0.0:
                                     a_contact = a_interp
                                     used_interp = True
 
                         if not used_interp:
-                            # 牛顿迭代求解 a：隐式公式 α = a²/R* - √(2πΓa/E*)
                             if delta_n >= 0.0:
                                 a_init = _math.sqrt(R_eff * max(delta_n, 1e-18))
                                 a = max(a_init, 0.5 * a0)
@@ -536,12 +545,10 @@ class DEMSimulator:
                                 a = a0
 
                             for _iter in range(20):
-                                # α(a) = a²/R* - √(2πΓa/E*)
                                 alpha_model = (a * a) / R_eff - _math.sqrt(coeff_alpha * a)
                                 f_newt = alpha_model - delta_n
                                 if abs(f_newt) < 1e-12 * max(1.0, abs(delta_n)):
                                     break
-                                # dα/da = 2a/R* - (1/2)√(2πΓ/(E*a))
                                 d_alpha_da = 2.0 * a / R_eff - 0.5 * _math.sqrt(coeff_alpha / max(a, 1e-30))
                                 if abs(d_alpha_da) < 1e-30:
                                     break
@@ -553,127 +560,149 @@ class DEMSimulator:
                             if a > 0.0:
                                 a_contact = a
                                 a3 = a * a * a
-                                # EDEM 标准法向力：F_n = 4E*a³/(3R*) - √(8πΓE*a³)
                                 F_hertz = (4.0 * E_star * a3) / (3.0 * R_eff)
                                 F_adhesion = _math.sqrt(8.0 * _math.pi * gamma * E_star * a3)
                                 F_elastic = F_hertz - F_adhesion
 
                         if a_contact > 0.0:
-                            # Tsuji 阻尼：F_dn = -2*sqrt(5/6)*β*sqrt(k_n*m*)*v^n
-                            # k_n = 2*E*a
                             k_n = 2.0 * E_star * a_contact
                             if beta_tsuji != 0.0 and k_n > 0.0:
                                 eta_n = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(mu_eff * k_n, 1e-18))
                                 F_damping = -eta_n * v_rel_n
                             else:
                                 F_damping = 0.0
-
                             Fn = F_elastic + F_damping
                         else:
                             Fn = 0.0
                 else:
-                    # 接触断裂：δ_n ≤ -α_f
                     Fn = 0.0
                     a_contact = 0.0
 
-                # 切向力
-                Ft = 0.0
+                # 切向力 (3D)
+                Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
                 if a_contact > 0.0 and Fn != 0.0:
-                    # 使用牛顿迭代求得的接触半径
                     k_t = 8.0 * G_star * a_contact
                     if k_t > 0.0:
-                        delta_t = hist_in[k] + v_rel_t_eff * dt
-                        F_ct = -k_t * delta_t
+                        # 切向位移历史 (3 components per pair)
+                        dt_hist_x = hist_in[k*3]   + vt_x * dt
+                        dt_hist_y = hist_in[k*3+1] + vt_y * dt
+                        dt_hist_z = hist_in[k*3+2] + vt_z * dt
+                        # 投影到切平面
+                        dot_dn = dt_hist_x * nx + dt_hist_y * ny + dt_hist_z * nz
+                        dt_hist_x -= dot_dn * nx
+                        dt_hist_y -= dot_dn * ny
+                        dt_hist_z -= dot_dn * nz
 
-                        # Tsuji 切向阻尼: F_dt = -η_t v_t,
-                        # 其中 η_t = -2 sqrt(5/6) β sqrt(k_t m*)
+                        F_ct_x = -k_t * dt_hist_x
+                        F_ct_y = -k_t * dt_hist_y
+                        F_ct_z = -k_t * dt_hist_z
+
                         if beta_tsuji != 0.0:
                             eta_t = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(k_t * mu_eff, 1.0e-18))
-                            F_dt = -eta_t * v_rel_t_eff
+                            F_dt_x = -eta_t * vt_x
+                            F_dt_y = -eta_t * vt_y
+                            F_dt_z = -eta_t * vt_z
                         else:
-                            F_dt = 0.0
+                            F_dt_x = 0.0; F_dt_y = 0.0; F_dt_z = 0.0
 
-                        F_trial = F_ct + F_dt
+                        Ft_trial_x = F_ct_x + F_dt_x
+                        Ft_trial_y = F_ct_y + F_dt_y
+                        Ft_trial_z = F_ct_z + F_dt_z
+                        Ft_trial_mag = _math.sqrt(Ft_trial_x**2 + Ft_trial_y**2 + Ft_trial_z**2)
 
-                        # 黏附摩擦上限：|F_n^t + 2 F_c|
                         F_normal_eff = Fn + 2.0 * F_c
                         F_limit_static = MU_S * abs(F_normal_eff)
 
-                        if abs(F_trial) <= F_limit_static:
-                            Ft = F_trial
-                            hist_out[k] = delta_t
+                        if Ft_trial_mag <= F_limit_static:
+                            Ft_x = Ft_trial_x
+                            Ft_y = Ft_trial_y
+                            Ft_z = Ft_trial_z
+                            hist_out[k*3]   = dt_hist_x
+                            hist_out[k*3+1] = dt_hist_y
+                            hist_out[k*3+2] = dt_hist_z
                         else:
                             F_limit_slide = MU_K * abs(F_normal_eff)
-                            if F_limit_slide > 0.0:
-                                # 滑动摩擦力方向与滑动速度相反
-                                if v_rel_t_eff > 1e-18:
-                                    v_sign = 1.0
-                                elif v_rel_t_eff < -1e-18:
-                                    v_sign = -1.0
-                                else:
-                                    v_sign = 0.0
-                                Ft = -F_limit_slide * v_sign
-                                hist_out[k] = -(F_limit_static / k_t) * v_sign
+                            if F_limit_slide > 0.0 and Ft_trial_mag > 1e-18:
+                                # 滑动方向
+                                slide_inv = 1.0 / Ft_trial_mag
+                                Ft_x = F_limit_slide * Ft_trial_x * slide_inv
+                                Ft_y = F_limit_slide * Ft_trial_y * slide_inv
+                                Ft_z = F_limit_slide * Ft_trial_z * slide_inv
+                                # 重置切向位移到库仑极限
+                                hist_out[k*3]   = -F_limit_static / k_t * Ft_trial_x * slide_inv
+                                hist_out[k*3+1] = -F_limit_static / k_t * Ft_trial_y * slide_inv
+                                hist_out[k*3+2] = -F_limit_static / k_t * Ft_trial_z * slide_inv
                             else:
-                                Ft = 0.0
-                                hist_out[k] = 0.0
+                                Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
+                                hist_out[k*3] = 0.0; hist_out[k*3+1] = 0.0; hist_out[k*3+2] = 0.0
                         contacts_mask[k] = 1.0
                     else:
-                        hist_out[k] = hist_in[k]
+                        hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
                 else:
-                    hist_out[k] = hist_in[k]
+                    hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
 
-                # 力与力矩叠加
-                Fx = Fn * nx + Ft * tx
-                Fy = Fn * ny + Ft * ty
-                fx[i] -= Fx; fy[i] -= Fy
-                fx[j] += Fx; fy[j] += Fy
-                tau[i] += -Ft * r
-                tau[j] += -Ft * r
-                # 滚动阻力矩
+                # 法向力 + 切向力 -> 总力
+                Fx_total = Fn * nx + Ft_x
+                Fy_total = Fn * ny + Ft_y
+                Fz_total = Fn * nz + Ft_z
+                fx[i] -= Fx_total; fy[i] -= Fy_total; fz[i] -= Fz_total
+                fx[j] += Fx_total; fy[j] += Fy_total; fz[j] += Fz_total
+
+                # 力矩 = -r * (n × F_t)
+                # n × F_t = (ny*Ftz - nz*Fty, nz*Ftx - nx*Ftz, nx*Fty - ny*Ftx)
+                torque_x = -r * (ny * Ft_z - nz * Ft_y)
+                torque_y = -r * (nz * Ft_x - nx * Ft_z)
+                torque_z = -r * (nx * Ft_y - ny * Ft_x)
+                tau_x[i] += torque_x; tau_y[i] += torque_y; tau_z[i] += torque_z
+                tau_x[j] += torque_x; tau_y[j] += torque_y; tau_z[j] += torque_z
+
+                # 滚动阻力矩 (3D)
                 if delta_n > 0.0:
                     T_roll = mu_r * abs(Fn) * r
-                    sgn_i = 1.0 if omega[i] > 1e-18 else (-1.0 if omega[i] < -1e-18 else 0.0)
-                    sgn_j = 1.0 if omega[j] > 1e-18 else (-1.0 if omega[j] < -1e-18 else 0.0)
-                    tau[i] += -T_roll * sgn_i
-                    tau[j] += -T_roll * sgn_j
+                    # 粒子 i
+                    oi_mag = _math.sqrt(omega_x[i]**2 + omega_y[i]**2 + omega_z[i]**2)
+                    if oi_mag > 1e-18:
+                        inv_oi = 1.0 / oi_mag
+                        tau_x[i] += -T_roll * omega_x[i] * inv_oi
+                        tau_y[i] += -T_roll * omega_y[i] * inv_oi
+                        tau_z[i] += -T_roll * omega_z[i] * inv_oi
+                    # 粒子 j
+                    oj_mag = _math.sqrt(omega_x[j]**2 + omega_y[j]**2 + omega_z[j]**2)
+                    if oj_mag > 1e-18:
+                        inv_oj = 1.0 / oj_mag
+                        tau_x[j] += -T_roll * omega_x[j] * inv_oj
+                        tau_y[j] += -T_roll * omega_y[j] * inv_oj
+                        tau_z[j] += -T_roll * omega_z[j] * inv_oj
 
-            return fx, fy, tau, hist_out, contacts_mask, max_abs_vn, min_approach_time
+            return fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, max_abs_vn, min_approach_time
 
     def _estimate_box_length(self) -> float:
         if not self.state.x.size:
             return 10.0 * self.mat.r
-        x_sorted = np.sort(self.state.x)
-        y_sorted = np.sort(self.state.y)
-        xspan = float(x_sorted[-1] - x_sorted[0])
-        yspan = float(y_sorted[-1] - y_sorted[0])
-        # 估计网格步长 h: 取非零最小相邻差值
+        xspan = float(np.max(self.state.x) - np.min(self.state.x))
+        yspan = float(np.max(self.state.y) - np.min(self.state.y))
+        zspan = float(np.max(self.state.z) - np.min(self.state.z))
         def _step_est(arr: np.ndarray) -> float:
             if arr.size < 2:
                 return 2.0 * self.mat.r
             diffs = np.diff(np.sort(arr))
-            # 过滤浮点微小噪声，取正的最小差
             pos = diffs[diffs > 1e-15]
             return float(np.min(pos)) if pos.size else 2.0 * self.mat.r
         hx = _step_est(self.state.x)
         hy = _step_est(self.state.y)
-        h_est = max(hx, hy)
-        # 目标边长约等于 N*h ≈ span + h
-        return max(xspan + h_est, yspan + h_est)
+        hz = _step_est(self.state.z)
+        h_est = max(hx, hy, hz)
+        return max(xspan + h_est, yspan + h_est, zspan + h_est)
 
-    def _compute_forces(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-        """返回 (fx, fy, tau, max_abs_vn, min_approach_time)。
-
-        max_abs_vn       : 所有接触对中最大 |v_n|（团簇内部稳定指标）
-        min_approach_time : 未接触近邻对中最小碰撞接近时间（碰撞预警）
-        """
+    def _compute_forces(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                                       np.ndarray, np.ndarray, np.ndarray,
+                                       float, float]:
+        """返回 (fx, fy, fz, tau_x, tau_y, tau_z, max_abs_vn, min_approach_time)。"""
         n = self.state.size()
-        fx = np.zeros(n); fy = np.zeros(n); tau = np.zeros(n)
-        # 使用邻域缓存（Verlet 邻居）：仅在位移超过 skin/2 时重建索引对
+        fx = np.zeros(n); fy = np.zeros(n); fz = np.zeros(n)
+        tau_x = np.zeros(n); tau_y = np.zeros(n); tau_z = np.zeros(n)
         idx_pairs = self._get_neighbor_pairs()
 
-        # 快路径：未启用 C++、未启用团簇冻结，且使用 Numba 与邻域缓存时，
-        # 直接在 Numba 内部根据 (i,j) 计算几何量，避免 Python 端的大循环。
         use_fast_numba_idx = (
             _NUMBA_AVAILABLE
             and bool(getattr(self.sim, "use_numba", False))
@@ -688,34 +717,35 @@ class DEMSimulator:
             j_idx = self._nb_j_idx[:m]
             dx_arr = self._nb_dx[:m]
             dy_arr = self._nb_dy[:m]
+            dz_arr = self._nb_dz[:m]
             d_arr = self._nb_d[:m]
-            # 直接使用与邻域缓存对齐的数组映射
-            hist_in = self._nb_hist_in[:m]
+            hist_in = self._nb_hist_in[:m*3]
             started_in = self._nb_started_in[:m]
             for k, (i, j) in enumerate(idx_pairs):
                 i_idx[k] = i; j_idx[k] = j
-                # 与缓存数组对齐拷贝输入历史
                 if self._pair_hist is not None and self._pair_started_arr is not None:
-                    hist_in[k] = float(self._pair_hist[k])
+                    hist_in[k*3]   = float(self._pair_hist[k*3])
+                    hist_in[k*3+1] = float(self._pair_hist[k*3+1])
+                    hist_in[k*3+2] = float(self._pair_hist[k*3+2])
                     started_in[k] = float(self._pair_started_arr[k])
                 else:
-                    # 回退：若未启用缓存数组（极少见），保持旧逻辑
                     key = (i, j) if i < j else (j, i)
-                    hist_in[k] = float(self.tangential_hist.get(key, 0.0))
+                    h_arr = self.tangential_hist.get(key, np.zeros(3))
+                    hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                     started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
 
-            # 在 Numba 内部根据当前坐标构建 dx, dy, d（含周期最小镜像）
             DEMSimulator._numba_build_geometry_from_idx(
-                self.state.x, self.state.y,
-                float(self.Lx), float(self.Ly),
-                i_idx, j_idx, dx_arr, dy_arr, d_arr,
+                self.state.x, self.state.y, self.state.z,
+                float(self.Lx), float(self.Ly), float(self.Lz),
+                i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
             )
 
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            fx, fy, tau, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
                 n,
-                i_idx, j_idx, dx_arr, dy_arr, d_arr,
-                self.state.vx, self.state.vy, self.state.omega,
+                i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
+                self.state.vx, self.state.vy, self.state.vz,
+                self.state.omega_x, self.state.omega_y, self.state.omega_z,
                 self.state.r, self.state.mass,
                 self.mat.E_star, self.mat.gamma, self.mat.e_n, self.mat.mu_r,
                 self.mat.nu, self.mat.MU_S, self.mat.MU_K,
@@ -728,86 +758,40 @@ class DEMSimulator:
                 self._jkr_a_tab,
                 self._jkr_F_tab,
             )
-            # 旋转黏滞统一叠加
-            tau += - self.mat.c_rot * self.state.omega
-            # 合并切向历史和接触标记
             contacts_2r: List[Tuple[int,int]] = []
-            # 输出写回数组映射，并构造 2r 邻接列表
             if self._pair_hist is not None and self._pair_started_arr is not None:
-                self._pair_hist[:m] = hist_out
+                self._pair_hist[:m*3] = hist_out
                 for k, (i, j) in enumerate(idx_pairs):
                     if contacts_mask[k] > 0.5:
                         self._pair_started_arr[k] = 1.0
                         key = (i, j) if i < j else (j, i)
                         contacts_2r.append(key)
             else:
-                # 回退：保持旧的字典方式
                 for k, (i, j) in enumerate(idx_pairs):
                     key = (i, j) if i < j else (j, i)
-                    self.tangential_hist[key] = float(hist_out[k])
+                    self.tangential_hist[key] = np.array([float(hist_out[k*3]), float(hist_out[k*3+1]), float(hist_out[k*3+2])])
                     if contacts_mask[k] > 0.5:
                         self.contact_started[key] = True
                         contacts_2r.append(key)
             self._contacts_2r = contacts_2r
-            # 在未启用自适应时间步长时，返回的 max_vn/min_approach 仅用于保持接口一致
-            return fx, fy, tau, float(nb_max_vn), float(nb_min_at)
+            return fx, fy, fz, tau_x, tau_y, tau_z, float(nb_max_vn), float(nb_min_at)
 
-        # 通用路径：需要 C++、团簇冻结或未启用邻域缓存时，
-        # 仍在 Python 端重建 (dx, dy, d) 列表并沿用原有逻辑。
-        pairs: List[Tuple[int, int, float, float, float]] = []
+        # 通用路径：需要 C++、团簇冻结或未启用邻域缓存时
+        pairs: List[Tuple[int, int, float, float, float, float]] = []
         r = self.state.r
-        # 邻接表是宽邻域（2r+skin），此处只保留物理上可能相关的近邻
         max_dist = 2.0 * r + max(0.0, float(self.skin))
         max_dist2 = max_dist * max_dist
         for (i, j) in idx_pairs:
             dx = float(self.state.x[j] - self.state.x[i])
             dy = float(self.state.y[j] - self.state.y[i])
-            dx, dy = self._minimal_image(dx, dy)
-            d2 = dx * dx + dy * dy
+            dz = float(self.state.z[j] - self.state.z[i])
+            dx, dy, dz = self._minimal_image(dx, dy, dz)
+            d2 = dx * dx + dy * dy + dz * dz
             if d2 <= max_dist2:
                 d = math.sqrt(d2)
-                pairs.append((i, j, dx, dy, d))
-        # 若启用并可用 C++ 内核，优先使用 C++
-        if (_CPP_AVAILABLE) and bool(getattr(self.sim, "use_cpp", False)) and (len(pairs) > 0):
-            m = len(pairs)
-            i_idx = np.empty(m, dtype=np.int64)
-            j_idx = np.empty(m, dtype=np.int64)
-            dx_arr = np.empty(m, dtype=np.float64)
-            dy_arr = np.empty(m, dtype=np.float64)
-            d_arr = np.empty(m, dtype=np.float64)
-            hist_in = np.empty(m, dtype=np.float64)
-            started_in = np.empty(m, dtype=np.float64)
-            keys: List[Tuple[int,int]] = []
-            for k, (i, j, dx, dy, d) in enumerate(pairs):
-                i_idx[k] = i; j_idx[k] = j
-                dx_arr[k] = dx; dy_arr[k] = dy; d_arr[k] = d
-                key = (i, j) if i < j else (j, i)
-                keys.append(key)
-                hist_in[k] = float(self.tangential_hist.get(key, 0.0))
-                started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
-            eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            fx, fy, tau, hist_out, contacts_mask = _cppkern.forces_kernel(
-                n,
-                i_idx, j_idx, dx_arr, dy_arr, d_arr,
-                self.state.vx, self.state.vy, self.state.omega,
-                self.state.r, self.state.mass,
-                self.mat.E_star, self.mat.gamma, self.mat.e_n, self.mat.mu_r,
-                self.mat.nu, self.mat.MU_S, self.mat.MU_K,
-                self.sim.dt, eta_c,
-                hist_in, started_in,
-            )
-            tau += - self.mat.c_rot * self.state.omega
-            contacts_2r: List[Tuple[int,int]] = []
-            for k, key in enumerate(keys):
-                self.tangential_hist[key] = float(hist_out[k])
-                if contacts_mask[k] > 0.5:
-                    self.contact_started[key] = True
-                    contacts_2r.append(key)
-            self._contacts_2r = contacts_2r
-            # C++ 内核暂不返回追踪量，使用保守默认值
-            return fx, fy, tau, float('inf'), 1e30
+                pairs.append((i, j, dx, dy, dz, d))
 
-        # 如果启用并可用 Numba，加速对遍历
+        # Numba 通用路径
         if (_NUMBA_AVAILABLE) and bool(getattr(self.sim, "use_numba", False)) and (len(pairs) > 0):
             m = len(pairs)
             self._ensure_nb_buf(m)
@@ -815,23 +799,25 @@ class DEMSimulator:
             j_idx = self._nb_j_idx[:m]
             dx_arr = self._nb_dx[:m]
             dy_arr = self._nb_dy[:m]
+            dz_arr = self._nb_dz[:m]
             d_arr = self._nb_d[:m]
-            hist_in = self._nb_hist_in[:m]
+            hist_in = self._nb_hist_in[:m*3]
             started_in = self._nb_started_in[:m]
             keys: List[Tuple[int,int]] = []
-            for k, (i, j, dx, dy, d) in enumerate(pairs):
+            for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
                 i_idx[k] = i; j_idx[k] = j
-                dx_arr[k] = dx; dy_arr[k] = dy; d_arr[k] = d
+                dx_arr[k] = dx; dy_arr[k] = dy; dz_arr[k] = dz; d_arr[k] = d
                 key = (i, j) if i < j else (j, i)
                 keys.append(key)
-                hist_in[k] = float(self.tangential_hist.get(key, 0.0))
+                h_arr = self.tangential_hist.get(key, np.zeros(3))
+                hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                 started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
-            # 预先计算 JKR 拉伸判别长度 eta_c（沿用现有 JKR 实现的值）
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            fx, fy, tau, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
                 n,
-                i_idx, j_idx, dx_arr, dy_arr, d_arr,
-                self.state.vx, self.state.vy, self.state.omega,
+                i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
+                self.state.vx, self.state.vy, self.state.vz,
+                self.state.omega_x, self.state.omega_y, self.state.omega_z,
                 self.state.r, self.state.mass,
                 self.mat.E_star, self.mat.gamma, self.mat.e_n, self.mat.mu_r,
                 self.mat.nu, self.mat.MU_S, self.mat.MU_K,
@@ -844,45 +830,52 @@ class DEMSimulator:
                 self._jkr_a_tab,
                 self._jkr_F_tab,
             )
-            # 旋转黏滞统一叠加
-            tau += - self.mat.c_rot * self.state.omega
-            # 合并切向历史和接触标记
             contacts_2r: List[Tuple[int,int]] = []
             for k, key in enumerate(keys):
-                self.tangential_hist[key] = float(hist_out[k])
+                self.tangential_hist[key] = np.array([float(hist_out[k*3]), float(hist_out[k*3+1]), float(hist_out[k*3+2])])
                 if contacts_mask[k] > 0.5:
                     self.contact_started[key] = True
                     contacts_2r.append(key)
             self._contacts_2r = contacts_2r
-            return fx, fy, tau, float(nb_max_vn), float(nb_min_at)
+            return fx, fy, fz, tau_x, tau_y, tau_z, float(nb_max_vn), float(nb_min_at)
 
-        # 否则走原有单线程路径
-        # 真接触列表（2r 内）用于连通体与切向历史
+        # Python 单线程回退路径
         contacts_2r: List[Tuple[int,int]] = []
         r = self.state.r
         mu = 0.5 * self.state.mass
         py_max_abs_vn = 0.0
         py_min_approach = 1e30
 
-        for (i, j, dx, dy, d) in pairs:
-            nx = dx / (d + 1e-18)
-            ny = dy / (d + 1e-18)
-            tx = -ny; ty = nx
+        for (i, j, dx, dy, dz, d) in pairs:
+            inv_d = 1.0 / (d + 1e-18)
+            nx = dx * inv_d
+            ny = dy * inv_d
+            nz = dz * inv_d
             delta_n = 2.0 * r - d
-            v_rel_n = (self.state.vx[j] - self.state.vx[i]) * nx + (self.state.vy[j] - self.state.vy[i]) * ny
-            v_rel_t = (self.state.vx[j] - self.state.vx[i]) * tx + (self.state.vy[j] - self.state.vy[i]) * ty
-            # 接触点滑动速度：v_slip = v_rel - r*(ω_i + ω_j)*t
-            v_rel_t_eff = v_rel_t - r * (self.state.omega[i] + self.state.omega[j])
+
+            dvx = self.state.vx[j] - self.state.vx[i]
+            dvy = self.state.vy[j] - self.state.vy[i]
+            dvz = self.state.vz[j] - self.state.vz[i]
+            v_rel_n = dvx * nx + dvy * ny + dvz * nz
+
+            # 接触点相对速度
+            wx = self.state.omega_x[i] + self.state.omega_x[j]
+            wy = self.state.omega_y[i] + self.state.omega_y[j]
+            wz = self.state.omega_z[i] + self.state.omega_z[j]
+            cross_x = wy * nz - wz * ny
+            cross_y = wz * nx - wx * nz
+            cross_z = wx * ny - wy * nx
+            vt_x = dvx - v_rel_n * nx - r * cross_x
+            vt_y = dvy - v_rel_n * ny - r * cross_y
+            vt_z = dvz - v_rel_n * nz - r * cross_z
 
             key = (i, j) if i < j else (j, i)
-            # 使用数组映射优先（启用邻域缓存时）
             if bool(getattr(self.sim, "use_neighbor_cache", False)) and self._pair_index:
                 idx = self._pair_index.get(key, -1)
                 started = (self._pair_started_arr[idx] > 0.5) if (idx >= 0 and self._pair_started_arr is not None) else False
             else:
                 started = bool(self.contact_started.get(key, False))
 
-            # --- 自适应步长追踪 ---
             if delta_n > 0.0 or started:
                 abs_vn = abs(v_rel_n)
                 if abs_vn > py_max_abs_vn:
@@ -896,68 +889,95 @@ class DEMSimulator:
                         py_min_approach = t_contact
 
             Fn = self.jkr.force(delta_n, v_rel_n, mu, contact_started=started)
-            Ft = 0.0
-            # 仅当法向有真实接触（Fn!=0 且 jkr 求得 a>0）时计算切向力
+            Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
             a_contact = float(self.jkr.last_newton_a or 0.0)
             if Fn != 0.0 and a_contact > 0.0:
-                # 切向历史优先使用数组映射（启用邻域缓存时）
                 if bool(getattr(self.sim, "use_neighbor_cache", False)) and self._pair_index:
                     idx = self._pair_index.get(key, -1)
-                    dth = float(self._pair_hist[idx]) if (idx >= 0 and self._pair_hist is not None) else 0.0
-                    Ft, dth_new = self.tan.force(a_contact, dth, v_rel_t_eff, self.sim.dt, Fn, self.jkr.F_c, mu)
                     if idx >= 0 and self._pair_hist is not None and self._pair_started_arr is not None:
-                        self._pair_hist[idx] = dth_new
+                        dth_x = float(self._pair_hist[idx*3])
+                        dth_y = float(self._pair_hist[idx*3+1])
+                        dth_z = float(self._pair_hist[idx*3+2])
+                    else:
+                        dth_x = 0.0; dth_y = 0.0; dth_z = 0.0
+                    Ft_x, Ft_y, Ft_z, new_x, new_y, new_z = self.tan.force_3d(
+                        a_contact, dth_x, dth_y, dth_z, vt_x, vt_y, vt_z,
+                        nx, ny, nz, self.sim.dt, Fn, self.jkr.F_c, mu)
+                    if idx >= 0 and self._pair_hist is not None and self._pair_started_arr is not None:
+                        self._pair_hist[idx*3]   = new_x
+                        self._pair_hist[idx*3+1] = new_y
+                        self._pair_hist[idx*3+2] = new_z
                         self._pair_started_arr[idx] = 1.0
                     contacts_2r.append(key)
                 else:
-                    dth = self.tangential_hist.get(key, 0.0)
-                    Ft, dth_new = self.tan.force(a_contact, dth, v_rel_t_eff, self.sim.dt, Fn, self.jkr.F_c, mu)
-                    self.tangential_hist[key] = dth_new
+                    h_arr = self.tangential_hist.get(key, np.zeros(3))
+                    Ft_x, Ft_y, Ft_z, new_x, new_y, new_z = self.tan.force_3d(
+                        a_contact, float(h_arr[0]), float(h_arr[1]), float(h_arr[2]),
+                        vt_x, vt_y, vt_z, nx, ny, nz,
+                        self.sim.dt, Fn, self.jkr.F_c, mu)
+                    self.tangential_hist[key] = np.array([new_x, new_y, new_z])
                     contacts_2r.append(key)
                     self.contact_started[key] = True
 
-            Fx = Fn * nx + Ft * tx
-            Fy = Fn * ny + Ft * ty
-            fx[i] -= Fx; fy[i] -= Fy
-            fx[j] += Fx; fy[j] += Fy
+            Fx_total = Fn * nx + Ft_x
+            Fy_total = Fn * ny + Ft_y
+            Fz_total = Fn * nz + Ft_z
+            fx[i] -= Fx_total; fy[i] -= Fy_total; fz[i] -= Fz_total
+            fx[j] += Fx_total; fy[j] += Fy_total; fz[j] += Fz_total
 
-            tau[i] += -Ft * r
-            tau[j] += -Ft * r
+            # 力矩 = -r * (n × F_t)
+            torque_x = -r * (ny * Ft_z - nz * Ft_y)
+            torque_y = -r * (nz * Ft_x - nx * Ft_z)
+            torque_z = -r * (nx * Ft_y - ny * Ft_x)
+            tau_x[i] += torque_x; tau_y[i] += torque_y; tau_z[i] += torque_z
+            tau_x[j] += torque_x; tau_y[j] += torque_y; tau_z[j] += torque_z
+
             if delta_n > 0.0:
                 T_roll = self.mat.mu_r * abs(Fn) * r
-                sgn_i = 1.0 if self.state.omega[i] > 1e-18 else (-1.0 if self.state.omega[i] < -1e-18 else 0.0)
-                sgn_j = 1.0 if self.state.omega[j] > 1e-18 else (-1.0 if self.state.omega[j] < -1e-18 else 0.0)
-                tau[i] += -T_roll * sgn_i
-                tau[j] += -T_roll * sgn_j
+                oi_mag = math.sqrt(self.state.omega_x[i]**2 + self.state.omega_y[i]**2 + self.state.omega_z[i]**2)
+                if oi_mag > 1e-18:
+                    inv_oi = 1.0 / oi_mag
+                    tau_x[i] += -T_roll * self.state.omega_x[i] * inv_oi
+                    tau_y[i] += -T_roll * self.state.omega_y[i] * inv_oi
+                    tau_z[i] += -T_roll * self.state.omega_z[i] * inv_oi
+                oj_mag = math.sqrt(self.state.omega_x[j]**2 + self.state.omega_y[j]**2 + self.state.omega_z[j]**2)
+                if oj_mag > 1e-18:
+                    inv_oj = 1.0 / oj_mag
+                    tau_x[j] += -T_roll * self.state.omega_x[j] * inv_oj
+                    tau_y[j] += -T_roll * self.state.omega_y[j] * inv_oj
+                    tau_z[j] += -T_roll * self.state.omega_z[j] * inv_oj
 
-        tau += - self.mat.c_rot * self.state.omega
         self._contacts_2r = contacts_2r
-        return fx, fy, tau, py_max_abs_vn, py_min_approach
+        return fx, fy, fz, tau_x, tau_y, tau_z, py_max_abs_vn, py_min_approach
 
     def _apply_periodic_wrap(self) -> None:
-        # 周期坐标包裹，保持中心域 [-L/2, L/2)
         self.state.x = (self.state.x + 0.5 * self.Lx) % self.Lx - 0.5 * self.Lx
         self.state.y = (self.state.y + 0.5 * self.Ly) % self.Ly - 0.5 * self.Ly
+        self.state.z = (self.state.z + 0.5 * self.Lz) % self.Lz - 0.5 * self.Lz
 
-    def _integrate(self, fx: np.ndarray, fy: np.ndarray, tau: np.ndarray) -> None:
+    def _integrate(self, fx: np.ndarray, fy: np.ndarray, fz: np.ndarray,
+                   tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray) -> None:
         dt = self.sim.dt
         m = self.state.mass
-        I_p = 0.4 * m * (self.state.r ** 2)  # 单粒子惯量
+        I_p = 0.4 * m * (self.state.r ** 2)
         self.state.vx += (fx / m) * dt
         self.state.vy += (fy / m) * dt
-        self.state.omega += (tau / I_p) * dt
+        self.state.vz += (fz / m) * dt
+        self.state.omega_x += (tau_x / I_p) * dt
+        self.state.omega_y += (tau_y / I_p) * dt
+        self.state.omega_z += (tau_z / I_p) * dt
         self.state.x += self.state.vx * dt
         self.state.y += self.state.vy * dt
+        self.state.z += self.state.vz * dt
 
     def _energies(self) -> Tuple[float, float, float]:
         m = self.state.mass
-        KE_trans = 0.5 * m * float(np.sum(self.state.vx**2 + self.state.vy**2))
+        KE_trans = 0.5 * m * float(np.sum(self.state.vx**2 + self.state.vy**2 + self.state.vz**2))
         I = 0.4 * m * (self.state.r ** 2)
-        KE_rot = 0.5 * I * float(np.sum(self.state.omega**2))
+        KE_rot = 0.5 * I * float(np.sum(self.state.omega_x**2 + self.state.omega_y**2 + self.state.omega_z**2))
         return KE_trans, KE_rot, KE_trans + KE_rot
 
     def _cluster_metrics(self) -> Tuple[int, float, float]:
-        """返回当前结构指标：(连通体数量, 全局平均配位数, 连通体平均回转半径)。"""
         n = int(self.state.size())
         if n <= 0:
             return 0, 0.0, 0.0
@@ -966,34 +986,35 @@ class DEMSimulator:
         comps = connected_components_from_contacts(n, contacts)
         cluster_count = int(len(comps))
 
-        # 全局平均配位数：接触图中每个粒子的度数平均
         degree = np.zeros(n, dtype=np.int64)
         for i, j in contacts:
             degree[int(i)] += 1
             degree[int(j)] += 1
         coordination_mean = float(np.mean(degree))
 
-        # 连通体平均回转半径（包含单粒子连通体，其 Rg 视为 0）
         rg_sum = 0.0
         x = self.state.x
         y = self.state.y
-        use_periodic = (self.Lx > 0.0) and (self.Ly > 0.0)
+        z = self.state.z
+        use_periodic = (self.Lx > 0.0) and (self.Ly > 0.0) and (self.Lz > 0.0)
         for comp in comps:
             if not comp:
                 continue
             if len(comp) == 1:
-                # 单粒子连通体 Rg=0
                 continue
             mb = np.asarray(comp, dtype=np.int64)
             ref = int(mb[0])
             dx = x[mb] - x[ref]
             dy = y[mb] - y[ref]
+            dz = z[mb] - z[ref]
             if use_periodic:
                 dx -= np.round(dx / self.Lx) * self.Lx
                 dy -= np.round(dy / self.Ly) * self.Ly
+                dz -= np.round(dz / self.Lz) * self.Lz
             cx = float(np.mean(dx))
             cy = float(np.mean(dy))
-            rg = float(np.sqrt(np.mean((dx - cx) ** 2 + (dy - cy) ** 2)))
+            cz = float(np.mean(dz))
+            rg = float(np.sqrt(np.mean((dx - cx) ** 2 + (dy - cy) ** 2 + (dz - cz) ** 2)))
             rg_sum += rg
 
         cluster_rg_mean = rg_sum / max(cluster_count, 1)
@@ -1027,6 +1048,7 @@ class DEMSimulator:
                 "sim.domain_scale": self.sim.domain_scale,
                 "sim.Lx": self.Lx,
                 "sim.Ly": self.Ly,
+                "sim.Lz": self.Lz,
                 "sim.use_numba": getattr(self.sim, "use_numba", False),
                 "sim.use_numba_parallel": getattr(self.sim, "use_numba_parallel", False),
                 "sim.use_cpp": getattr(self.sim, "use_cpp", False),
@@ -1054,10 +1076,11 @@ class DEMSimulator:
                 self.Lx,
                 self.Ly,
                 os.path.join(self.sim.snapshot_dir, "snap_000000_t0.000e+00.png"),
+                Lz=self.Lz,
                 dt_info=init_dt_info,
             )
             KE_t0, KE_r0, KE_sum0 = self._energies()
-            vmax0 = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
+            vmax0 = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2 + self.state.vz**2)))
             cluster_count0, coord_mean0, rg_mean0 = self._cluster_metrics()
             self.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
         snap_idx = 0
@@ -1069,7 +1092,7 @@ class DEMSimulator:
             # ---- 自适应时间步长决策（基于当前全局最大速度） ----
             current_dt = self._dt_normal
             dt_factor = 1.0
-            vmax_now = float(np.max(np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy)))
+            vmax_now = float(np.max(np.sqrt(self.state.vx * self.state.vx + self.state.vy * self.state.vy + self.state.vz * self.state.vz)))
             if self._adaptive_enabled:
                 a = self._adaptive_vmax_ema_alpha
                 self._vmax_approx = a * vmax_now + (1.0 - a) * self._vmax_approx
@@ -1089,7 +1112,7 @@ class DEMSimulator:
                 if dt_factor > self._adaptive_factor_max:
                     self._adaptive_factor_max = dt_factor
 
-            fx, fy, tau, max_abs_vn, min_approach_time = self._compute_forces()
+            fx, fy, fz, tau_x, tau_y, tau_z, max_abs_vn, min_approach_time = self._compute_forces()
 
             # 快照与报告
             if t >= next_snap:
@@ -1101,15 +1124,16 @@ class DEMSimulator:
                     dt_info = f"dt={self._dt_normal:.1e}x{dt_factor:.2f}, vmax={vmax_now:.2e}"
                 self.saver.save(self.state, t, self.Lx, self.Ly,
                                 os.path.join(self.sim.snapshot_dir, fname),
+                                Lz=self.Lz,
                                 dt_info=dt_info,
                                 max_abs_vn=max_abs_vn)
                 KE_t, KE_r, KE_sum = self._energies()
-                vmax = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
+                vmax = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2 + self.state.vz**2)))
                 cluster_count, coord_mean, rg_mean = self._cluster_metrics()
                 self.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
                 next_snap += snap_dt
 
-            self._integrate(fx, fy, tau)
+            self._integrate(fx, fy, fz, tau_x, tau_y, tau_z)
             self._apply_periodic_wrap()
             t += current_dt
             step += 1
@@ -1117,9 +1141,9 @@ class DEMSimulator:
         # 恢复基准步长
         self.sim.dt = self._dt_normal
         # 结束快照
-        self.saver.save(self.state, t, self.Lx, self.Ly, os.path.join(self.sim.snapshot_dir, "final_snapshot.png"))
+        self.saver.save(self.state, t, self.Lx, self.Ly, os.path.join(self.sim.snapshot_dir, "final_snapshot.png"), Lz=self.Lz)
         KE_tf, KE_rf, KE_sumf = self._energies()
-        vmaxf = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2)))
+        vmaxf = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2 + self.state.vz**2)))
         cluster_countf, coord_meanf, rg_meanf = self._cluster_metrics()
         self.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf, cluster_countf, coord_meanf, rg_meanf)
         elapsed = time.perf_counter() - start_time
