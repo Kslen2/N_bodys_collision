@@ -75,6 +75,9 @@ def main() -> None:
         use_jkr_interp=bool(sim.get("use_jkr_interp", False)),
         jkr_interp_points=int(sim.get("jkr_interp_points", 512)),
         jkr_interp_alpha_factor=float(sim.get("jkr_interp_alpha_factor", 5.0)),
+        trajectory_record=bool(sim.get("trajectory_record", True)),
+        trajectory_stride=int(sim.get("trajectory_stride", 100)),
+        trajectory_filename=str(sim.get("trajectory_filename", "trajectory.h5")),
     )
 
     runner = DEMSimulator(materials, sim_params, state)

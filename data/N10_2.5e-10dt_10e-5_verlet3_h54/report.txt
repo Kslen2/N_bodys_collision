@@ -1,0 +1,44 @@
+# t(s)	KE_trans	KE_rot	KE_total	Vmax	cluster_count	coordination_mean	cluster_rg_mean
+# param.materials.r	7e-07
+# param.materials.rho	2650.0
+# param.materials.E	50000000000.0
+# param.materials.nu	0.3
+# param.materials.gamma	0.25
+# param.materials.MU_S	0.5
+# param.materials.MU_K	0.5
+# param.materials.e_n	0.6
+# param.materials.mu_r	0.5
+# param.materials.c_rot	0.0
+# param.sim.dt	2.5e-10
+# param.sim.t_end	0.0001
+# param.sim.skin_factor	0.2
+# param.sim.snapshot_interval	1e-05
+# param.sim.save_stride	1
+# param.sim.domain_scale	1.0
+# param.sim.Lx	5.4e-05
+# param.sim.Ly	5.4e-05
+# param.sim.Lz	5.4e-05
+# param.sim.use_numba	True
+# param.sim.use_numba_parallel	False
+# param.sim.use_cpp	False
+# param.sim.trajectory_record	True
+# param.sim.trajectory_stride	100
+# param.sim.trajectory_filename	trajectory.h5
+# param.sim.adaptive_timestep	True
+# param.sim.adaptive_dt_min_factor	1.0
+# param.sim.adaptive_dt_max_factor	1.0
+# param.sim.adaptive_vmax_ema_alpha	0.1
+# param.sim.adaptive_vmax_init	3.99951438572281
+# param.state.N	1000
+0.000000e+00	1.024148e-11	0.000000e+00	1.024148e-11	3.999514e+00	1000	0.000000e+00	0.000000e+00
+1.000000e-05	5.724990e-12	4.323820e-14	5.768229e-12	3.990082e+00	885	2.340000e-01	7.956397e-08
+2.000000e-05	3.449639e-12	3.285753e-14	3.482497e-12	3.955886e+00	751	5.320000e-01	1.722731e-07
+3.000000e-05	2.244437e-12	2.206025e-14	2.266497e-12	3.955886e+00	634	8.320000e-01	2.535978e-07
+4.000025e-05	1.548022e-12	1.439491e-14	1.562417e-12	3.906147e+00	523	1.120000e+00	3.318130e-07
+5.000025e-05	1.170060e-12	1.017026e-14	1.180230e-12	2.907292e+00	439	1.362000e+00	4.247211e-07
+6.000025e-05	9.215326e-13	5.497906e-15	9.270305e-13	2.907292e+00	371	1.572000e+00	5.067416e-07
+7.000025e-05	7.011813e-13	3.272416e-15	7.044537e-13	2.907292e+00	304	1.756000e+00	5.942101e-07
+8.000025e-05	5.693744e-13	3.129011e-15	5.725034e-13	2.377416e+00	269	1.876000e+00	6.525626e-07
+9.000000e-05	4.629749e-13	2.556300e-15	4.655312e-13	1.978703e+00	240	1.990000e+00	7.289693e-07
+1.000000e-04	3.696022e-13	1.875164e-15	3.714774e-13	1.978703e+00	203	2.122000e+00	8.360375e-07
+# runtime(s)	638.785582

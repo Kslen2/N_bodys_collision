@@ -287,11 +287,40 @@ if _NUMBA_AVAILABLE:
         return pair_i, pair_j, pair_dx, pair_dy, pair_dz, pair_d
 
 
-def find_contacts_numba(x: np.ndarray, y: np.ndarray, z: np.ndarray,
-                        prm: NeighborParams, use_parallel: bool = False) -> List[Tuple[int, int, float, float, float, float]]:
-    """Numba 加速的三维邻域搜索（周期边界 + 3×3×3 邻域）"""
+def find_contacts_numba_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    prm: NeighborParams,
+    use_parallel: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Numba 邻域搜索（数组输出，避免构造 Python tuple/list）。"""
     if not _NUMBA_AVAILABLE:
-        return find_contacts(x, y, z, prm)
+        pairs = find_contacts(x, y, z, prm)
+        m = len(pairs)
+        if m == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
+        pi = np.empty(m, dtype=np.int64)
+        pj = np.empty(m, dtype=np.int64)
+        pdx = np.empty(m, dtype=np.float64)
+        pdy = np.empty(m, dtype=np.float64)
+        pdz = np.empty(m, dtype=np.float64)
+        pd = np.empty(m, dtype=np.float64)
+        for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
+            pi[k] = int(i)
+            pj[k] = int(j)
+            pdx[k] = float(dx)
+            pdy[k] = float(dy)
+            pdz[k] = float(dz)
+            pd[k] = float(d)
+        return pi, pj, pdx, pdy, pdz, pd
 
     r, skin = float(prm.r), float(prm.skin)
     thresh = 2.0 * r + max(0.0, skin)
@@ -302,7 +331,31 @@ def find_contacts_numba(x: np.ndarray, y: np.ndarray, z: np.ndarray,
     Lz = float(prm.Lz or 0.0)
 
     if Lx <= 0.0 or Ly <= 0.0 or Lz <= 0.0:
-        return find_contacts(x, y, z, prm)
+        pairs = find_contacts(x, y, z, prm)
+        m = len(pairs)
+        if m == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
+        pi = np.empty(m, dtype=np.int64)
+        pj = np.empty(m, dtype=np.int64)
+        pdx = np.empty(m, dtype=np.float64)
+        pdy = np.empty(m, dtype=np.float64)
+        pdz = np.empty(m, dtype=np.float64)
+        pd = np.empty(m, dtype=np.float64)
+        for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
+            pi[k] = int(i)
+            pj[k] = int(j)
+            pdx[k] = float(dx)
+            pdy[k] = float(dy)
+            pdz[k] = float(dz)
+            pd[k] = float(d)
+        return pi, pj, pdx, pdy, pdz, pd
 
     n = x.shape[0]
     Nx = max(1, int(Lx / cell))
@@ -322,7 +375,14 @@ def find_contacts_numba(x: np.ndarray, y: np.ndarray, z: np.ndarray,
             pair_offsets[i] = total_pairs
             total_pairs += neighbor_counts[i]
         if total_pairs == 0:
-            return []
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
         pair_i, pair_j, pair_dx, pair_dy, pair_dz, pair_d = _numba_find_contacts_parallel(
             xp, yp, zp, cell_start, cell_count, sorted_ids, Nx, Ny, Nz, Lx, Ly, Lz, thresh,
             pair_offsets, int(total_pairs)
@@ -333,6 +393,15 @@ def find_contacts_numba(x: np.ndarray, y: np.ndarray, z: np.ndarray,
             xp, yp, zp, cell_start, cell_count, sorted_ids, Nx, Ny, Nz, Lx, Ly, Lz, thresh, max_pairs
         )
 
+    return pair_i, pair_j, pair_dx, pair_dy, pair_dz, pair_d
+
+
+def find_contacts_numba(x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                        prm: NeighborParams, use_parallel: bool = False) -> List[Tuple[int, int, float, float, float, float]]:
+    """Numba 加速的三维邻域搜索（周期边界 + 3×3×3 邻域）"""
+    pair_i, pair_j, pair_dx, pair_dy, pair_dz, pair_d = find_contacts_numba_arrays(
+        x, y, z, prm, use_parallel=use_parallel
+    )
     pairs = []
     for k in range(len(pair_i)):
         pairs.append((int(pair_i[k]), int(pair_j[k]), float(pair_dx[k]), float(pair_dy[k]), float(pair_dz[k]), float(pair_d[k])))
@@ -667,12 +736,40 @@ def find_contacts_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
     return find_contacts(x, y, z, prm)
 
 
-def find_contacts_numba_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
-                                  prm: NeighborParams,
-                                  use_parallel: bool = False) -> List[Tuple[int, int, float, float, float, float]]:
-    """Numba 三维空间哈希自适应邻域搜索（周期边界）"""
+def find_contacts_numba_adaptive_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    prm: NeighborParams,
+    use_parallel: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Numba 空间哈希邻域搜索（数组输出，避免构造 Python tuple/list）。"""
     if not _NUMBA_AVAILABLE:
-        return find_contacts(x, y, z, prm)
+        pairs = find_contacts(x, y, z, prm)
+        m = len(pairs)
+        if m == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
+        pi = np.empty(m, dtype=np.int64)
+        pj = np.empty(m, dtype=np.int64)
+        pdx = np.empty(m, dtype=np.float64)
+        pdy = np.empty(m, dtype=np.float64)
+        pdz = np.empty(m, dtype=np.float64)
+        pd = np.empty(m, dtype=np.float64)
+        for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
+            pi[k] = int(i)
+            pj[k] = int(j)
+            pdx[k] = float(dx)
+            pdy[k] = float(dy)
+            pdz[k] = float(dz)
+            pd[k] = float(d)
+        return pi, pj, pdx, pdy, pdz, pd
     r, skin = float(prm.r), float(prm.skin)
     thresh = 2.0 * r + max(0.0, skin)
     cell = float(prm.cell_size or thresh)
@@ -681,10 +778,41 @@ def find_contacts_numba_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
     Ly = float(prm.Ly or 0.0)
     Lz = float(prm.Lz or 0.0)
     if Lx <= 0.0 or Ly <= 0.0 or Lz <= 0.0:
-        return find_contacts(x, y, z, prm)
+        pairs = find_contacts(x, y, z, prm)
+        m = len(pairs)
+        if m == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
+        pi = np.empty(m, dtype=np.int64)
+        pj = np.empty(m, dtype=np.int64)
+        pdx = np.empty(m, dtype=np.float64)
+        pdy = np.empty(m, dtype=np.float64)
+        pdz = np.empty(m, dtype=np.float64)
+        pd = np.empty(m, dtype=np.float64)
+        for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
+            pi[k] = int(i)
+            pj[k] = int(j)
+            pdx[k] = float(dx)
+            pdy[k] = float(dy)
+            pdz[k] = float(dz)
+            pd[k] = float(d)
+        return pi, pj, pdx, pdy, pdz, pd
     n = x.shape[0]
     if n == 0:
-        return []
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+        )
     Nx = max(1, int(Lx / cell))
     Ny = max(1, int(Ly / cell))
     Nz = max(1, int(Lz / cell))
@@ -704,7 +832,14 @@ def find_contacts_numba_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
             pair_offsets[i] = total_pairs
             total_pairs += neighbor_counts[i]
         if total_pairs == 0:
-            return []
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.float64),
+            )
         pi, pj, pdx, pdy, pdz, pd = _numba_find_contacts_hash_parallel(
             xp, yp, zp, hash_start, hash_count, sorted_ids, gx_arr, gy_arr, gz_arr,
             Nx, Ny, Nz, Lx, Ly, Lz, table_size, thresh,
@@ -716,6 +851,16 @@ def find_contacts_numba_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
             xp, yp, zp, hash_start, hash_count, sorted_ids, gx_arr, gy_arr, gz_arr,
             Nx, Ny, Nz, Lx, Ly, Lz, table_size, thresh, max_pairs
         )
+    return pi, pj, pdx, pdy, pdz, pd
+
+
+def find_contacts_numba_adaptive(x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                                  prm: NeighborParams,
+                                  use_parallel: bool = False) -> List[Tuple[int, int, float, float, float, float]]:
+    """Numba 三维空间哈希自适应邻域搜索（周期边界）"""
+    pi, pj, pdx, pdy, pdz, pd = find_contacts_numba_adaptive_arrays(
+        x, y, z, prm, use_parallel=use_parallel
+    )
     pairs = []
     for k in range(len(pi)):
         pairs.append((int(pi[k]), int(pj[k]), float(pdx[k]), float(pdy[k]), float(pdz[k]), float(pd[k])))

@@ -32,8 +32,18 @@ try:
     from ..physics.contact.rolling import RollingParams, RollingResistance
     from ..physics.quaternion import update_orientations
     from .particle_system import SystemState
-    from .contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
+    from .contact_detector import (
+        NeighborParams,
+        find_contacts,
+        find_contacts_numba,
+        find_contacts_numba_arrays,
+        connected_components_from_contacts,
+        find_contacts_adaptive,
+        find_contacts_numba_adaptive,
+        find_contacts_numba_adaptive_arrays,
+    )
     from ..io.snapshot_saver import SnapshotSaver
+    from ..io.trajectory_recorder import TrajectoryRecorder, TrajectoryRecorderConfig
     from ..visualization.report_generator import ReportWriter
 except ImportError:
     _HERE = os.path.abspath(os.path.dirname(__file__))
@@ -45,8 +55,18 @@ except ImportError:
     from src.physics.contact.tangential import TangentialParams, TangentialFriction
     from src.physics.contact.rolling import RollingParams, RollingResistance
     from src.simulation.particle_system import SystemState
-    from src.simulation.contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
+    from src.simulation.contact_detector import (
+        NeighborParams,
+        find_contacts,
+        find_contacts_numba,
+        find_contacts_numba_arrays,
+        connected_components_from_contacts,
+        find_contacts_adaptive,
+        find_contacts_numba_adaptive,
+        find_contacts_numba_adaptive_arrays,
+    )
     from src.io.snapshot_saver import SnapshotSaver
+    from src.io.trajectory_recorder import TrajectoryRecorder, TrajectoryRecorderConfig
     from src.visualization.report_generator import ReportWriter
     from src.physics.quaternion import update_orientations
 
@@ -87,6 +107,10 @@ class SimParams:
     jkr_interp_alpha_factor: float = 5.0
     # 自适应动态网格（四叉树 / 空间哈希）
     use_adaptive_grid: bool = False
+    # 轨迹记录（HDF5）
+    trajectory_record: bool = True
+    trajectory_stride: int = 100
+    trajectory_filename: str = "trajectory.h5"
 
 
 class DEMSimulator:
@@ -160,6 +184,14 @@ class DEMSimulator:
         # outputs
         os.makedirs(self.sim.snapshot_dir, exist_ok=True)
         self.saver = SnapshotSaver(self.sim.snapshot_dir, snapshot_show_velocity=bool(getattr(self.sim, "snapshot_show_velocity", True)))
+        self.traj = TrajectoryRecorder(
+            self.sim.snapshot_dir,
+            TrajectoryRecorderConfig(
+                enabled=bool(getattr(self.sim, "trajectory_record", True)),
+                stride=int(getattr(self.sim, "trajectory_stride", 100)),
+                filename=str(getattr(self.sim, "trajectory_filename", "trajectory.h5")),
+            ),
+        )
         self.report = ReportWriter(self.sim.snapshot_dir)
         self._next_snap = 0.0
         # 邻域缓存（Verlet 邻居）：按粒子最大位移判断何时重建
@@ -210,6 +242,8 @@ class DEMSimulator:
         self._nb_d = None
         self._nb_hist_in = None
         self._nb_started_in = None
+        self._nb_hist_out = None
+        self._nb_contacts_mask = None
 
     def _ensure_nb_buf(self, m: int) -> None:
         if not _NUMBA_AVAILABLE:
@@ -225,6 +259,8 @@ class DEMSimulator:
         self._nb_d = np.empty(new_cap, dtype=np.float64)
         self._nb_hist_in = np.empty(new_cap * 3, dtype=np.float64)
         self._nb_started_in = np.empty(new_cap, dtype=np.float64)
+        self._nb_hist_out = np.empty(new_cap * 3, dtype=np.float64)
+        self._nb_contacts_mask = np.empty(new_cap, dtype=np.float64)
         self._nbuf_capacity = new_cap
 
     # ------------------------------
@@ -432,18 +468,25 @@ class DEMSimulator:
             dalpha: float,
             a_tab: np.ndarray,
             F_tab: np.ndarray,
-        ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
-                    np.ndarray, np.ndarray, np.ndarray,
-                    np.ndarray, np.ndarray,
-                    float, float]:
-            fx = np.zeros(n)
-            fy = np.zeros(n)
-            fz = np.zeros(n)
-            tau_x = np.zeros(n)
-            tau_y = np.zeros(n)
-            tau_z = np.zeros(n)
-            hist_out = np.empty(i_idx.size * 3)
-            contacts_mask = np.zeros(i_idx.size)
+            fx: np.ndarray,
+            fy: np.ndarray,
+            fz: np.ndarray,
+            tau_x: np.ndarray,
+            tau_y: np.ndarray,
+            tau_z: np.ndarray,
+            hist_out: np.ndarray,
+            contacts_mask: np.ndarray,
+        ) -> tuple[float, float]:
+            for i in range(n):
+                fx[i] = 0.0
+                fy[i] = 0.0
+                fz[i] = 0.0
+                tau_x[i] = 0.0
+                tau_y[i] = 0.0
+                tau_z[i] = 0.0
+            for k in range(i_idx.size):
+                contacts_mask[k] = 0.0
+
             max_abs_vn = 0.0
             min_approach_time = 1e30
             mu_eff = 0.5 * mass
@@ -687,7 +730,7 @@ class DEMSimulator:
                         tau_y[j] += -T_roll * omega_y[j] * inv_oj
                         tau_z[j] += -T_roll * omega_z[j] * inv_oj
 
-            return fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, max_abs_vn, min_approach_time
+            return max_abs_vn, min_approach_time
 
     def _estimate_box_length(self) -> float:
         if not self.state.x.size:
@@ -714,7 +757,6 @@ class DEMSimulator:
         n = self.state.size()
         fx = np.zeros(n); fy = np.zeros(n); fz = np.zeros(n)
         tau_x = np.zeros(n); tau_y = np.zeros(n); tau_z = np.zeros(n)
-        idx_pairs = self._get_neighbor_pairs()
 
         use_fast_numba_idx = (
             _NUMBA_AVAILABLE
@@ -722,6 +764,94 @@ class DEMSimulator:
             and not bool(getattr(self.sim, "use_cpp", False))
             and bool(getattr(self.sim, "use_neighbor_cache", False))
         )
+
+        use_numba_direct_arrays = (
+            _NUMBA_AVAILABLE
+            and bool(getattr(self.sim, "use_numba", False))
+            and not bool(getattr(self.sim, "use_cpp", False))
+            and not bool(getattr(self.sim, "use_neighbor_cache", False))
+        )
+
+        if use_numba_direct_arrays:
+            use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
+            use_adaptive = bool(getattr(self.sim, "use_adaptive_grid", False))
+            if use_adaptive:
+                i_idx_raw, j_idx_raw, dx_arr_raw, dy_arr_raw, dz_arr_raw, d_arr_raw = find_contacts_numba_adaptive_arrays(
+                    self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel
+                )
+            else:
+                i_idx_raw, j_idx_raw, dx_arr_raw, dy_arr_raw, dz_arr_raw, d_arr_raw = find_contacts_numba_arrays(
+                    self.state.x, self.state.y, self.state.z, self.neigh, use_parallel=use_parallel
+                )
+
+            m = int(i_idx_raw.size)
+            if m > 0:
+                self._ensure_nb_buf(m)
+                i_idx = self._nb_i_idx[:m]
+                j_idx = self._nb_j_idx[:m]
+                dx_arr = self._nb_dx[:m]
+                dy_arr = self._nb_dy[:m]
+                dz_arr = self._nb_dz[:m]
+                d_arr = self._nb_d[:m]
+                hist_in = self._nb_hist_in[:m*3]
+                started_in = self._nb_started_in[:m]
+                hist_out = self._nb_hist_out[:m*3]
+                contacts_mask = self._nb_contacts_mask[:m]
+                keys: List[Tuple[int, int]] = []
+
+                i_idx[:] = i_idx_raw
+                j_idx[:] = j_idx_raw
+                dx_arr[:] = dx_arr_raw
+                dy_arr[:] = dy_arr_raw
+                dz_arr[:] = dz_arr_raw
+                d_arr[:] = d_arr_raw
+
+                for k in range(m):
+                    i = int(i_idx[k]); j = int(j_idx[k])
+                    key = (i, j) if i < j else (j, i)
+                    keys.append(key)
+                    h_arr = self.tangential_hist.get(key)
+                    if h_arr is None:
+                        hist_in[k*3] = 0.0; hist_in[k*3+1] = 0.0; hist_in[k*3+2] = 0.0
+                    else:
+                        hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
+                    started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
+
+                eta_c = float(getattr(self.jkr, "eta_c", 0.0))
+                nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+                    n,
+                    i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
+                    self.state.vx, self.state.vy, self.state.vz,
+                    self.state.omega_x, self.state.omega_y, self.state.omega_z,
+                    self.state.r, self.state.mass,
+                    self.mat.E_star, self.mat.gamma, self.mat.e_n, self.mat.mu_r,
+                    self.mat.nu, self.mat.MU_S, self.mat.MU_K,
+                    self.sim.dt, eta_c,
+                    hist_in, started_in,
+                    1 if self._jkr_interp_use else 0,
+                    float(self._jkr_alpha_min),
+                    float(self._jkr_alpha_max),
+                    float(self._jkr_dalpha),
+                    self._jkr_a_tab,
+                    self._jkr_F_tab,
+                    fx, fy, fz,
+                    tau_x, tau_y, tau_z,
+                    hist_out, contacts_mask,
+                )
+
+                contacts_2r: List[Tuple[int, int]] = []
+                for k, key in enumerate(keys):
+                    self.tangential_hist[key] = np.array([float(hist_out[k*3]), float(hist_out[k*3+1]), float(hist_out[k*3+2])])
+                    if contacts_mask[k] > 0.5:
+                        self.contact_started[key] = True
+                        contacts_2r.append(key)
+                self._contacts_2r = contacts_2r
+                return fx, fy, fz, tau_x, tau_y, tau_z, float(nb_max_vn), float(nb_min_at)
+
+            self._contacts_2r = []
+            return fx, fy, fz, tau_x, tau_y, tau_z, 0.0, 1e30
+
+        idx_pairs = self._get_neighbor_pairs()
 
         if use_fast_numba_idx and idx_pairs:
             m = len(idx_pairs)
@@ -734,6 +864,8 @@ class DEMSimulator:
             d_arr = self._nb_d[:m]
             hist_in = self._nb_hist_in[:m*3]
             started_in = self._nb_started_in[:m]
+            hist_out = self._nb_hist_out[:m*3]
+            contacts_mask = self._nb_contacts_mask[:m]
             for k, (i, j) in enumerate(idx_pairs):
                 i_idx[k] = i; j_idx[k] = j
                 if self._pair_hist is not None and self._pair_started_arr is not None:
@@ -743,8 +875,11 @@ class DEMSimulator:
                     started_in[k] = float(self._pair_started_arr[k])
                 else:
                     key = (i, j) if i < j else (j, i)
-                    h_arr = self.tangential_hist.get(key, np.zeros(3))
-                    hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
+                    h_arr = self.tangential_hist.get(key)
+                    if h_arr is None:
+                        hist_in[k*3] = 0.0; hist_in[k*3+1] = 0.0; hist_in[k*3+2] = 0.0
+                    else:
+                        hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                     started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
 
             DEMSimulator._numba_build_geometry_from_idx(
@@ -754,7 +889,7 @@ class DEMSimulator:
             )
 
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
                 n,
                 i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
                 self.state.vx, self.state.vy, self.state.vz,
@@ -770,6 +905,9 @@ class DEMSimulator:
                 float(self._jkr_dalpha),
                 self._jkr_a_tab,
                 self._jkr_F_tab,
+                fx, fy, fz,
+                tau_x, tau_y, tau_z,
+                hist_out, contacts_mask,
             )
             contacts_2r: List[Tuple[int,int]] = []
             if self._pair_hist is not None and self._pair_started_arr is not None:
@@ -816,17 +954,22 @@ class DEMSimulator:
             d_arr = self._nb_d[:m]
             hist_in = self._nb_hist_in[:m*3]
             started_in = self._nb_started_in[:m]
+            hist_out = self._nb_hist_out[:m*3]
+            contacts_mask = self._nb_contacts_mask[:m]
             keys: List[Tuple[int,int]] = []
             for k, (i, j, dx, dy, dz, d) in enumerate(pairs):
                 i_idx[k] = i; j_idx[k] = j
                 dx_arr[k] = dx; dy_arr[k] = dy; dz_arr[k] = dz; d_arr[k] = d
                 key = (i, j) if i < j else (j, i)
                 keys.append(key)
-                h_arr = self.tangential_hist.get(key, np.zeros(3))
-                hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
+                h_arr = self.tangential_hist.get(key)
+                if h_arr is None:
+                    hist_in[k*3] = 0.0; hist_in[k*3+1] = 0.0; hist_in[k*3+2] = 0.0
+                else:
+                    hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                 started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            fx, fy, fz, tau_x, tau_y, tau_z, hist_out, contacts_mask, nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
                 n,
                 i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
                 self.state.vx, self.state.vy, self.state.vz,
@@ -842,6 +985,9 @@ class DEMSimulator:
                 float(self._jkr_dalpha),
                 self._jkr_a_tab,
                 self._jkr_F_tab,
+                fx, fy, fz,
+                tau_x, tau_y, tau_z,
+                hist_out, contacts_mask,
             )
             contacts_2r: List[Tuple[int,int]] = []
             for k, key in enumerate(keys):
@@ -1119,6 +1265,9 @@ class DEMSimulator:
                 "sim.use_numba": getattr(self.sim, "use_numba", False),
                 "sim.use_numba_parallel": getattr(self.sim, "use_numba_parallel", False),
                 "sim.use_cpp": getattr(self.sim, "use_cpp", False),
+                "sim.trajectory_record": getattr(self.sim, "trajectory_record", True),
+                "sim.trajectory_stride": getattr(self.sim, "trajectory_stride", 100),
+                "sim.trajectory_filename": getattr(self.sim, "trajectory_filename", "trajectory.h5"),
                 "sim.adaptive_timestep": getattr(self.sim, "adaptive_timestep", False),
                 "sim.adaptive_dt_min_factor": self._adaptive_dt_min_factor,
                 "sim.adaptive_dt_max_factor": self._adaptive_dt_max_factor,
@@ -1126,6 +1275,16 @@ class DEMSimulator:
                 "sim.adaptive_vmax_init": self._vmax_init,
                 "state.N": int(self.state.size()),
             }
+
+            if bool(getattr(self.sim, "trajectory_record", True)):
+                self.traj.start(
+                    int(self.state.size()),
+                    Lx=float(self.Lx),
+                    Ly=float(self.Ly),
+                    Lz=float(self.Lz),
+                    metadata=param_dict,
+                )
+
             # 若 ReportWriter 支持写入参数，则调用；旧版本保持兼容
             write_params = getattr(self.report, "write_params", None)
             if callable(write_params):
@@ -1150,6 +1309,18 @@ class DEMSimulator:
             vmax0 = float(np.max(np.sqrt(self.state.vx**2 + self.state.vy**2 + self.state.vz**2)))
             cluster_count0, coord_mean0, rg_mean0 = self._cluster_metrics()
             self.report.write_step(0.0, KE_t0, KE_r0, KE_sum0, vmax0, cluster_count0, coord_mean0, rg_mean0)
+
+        if bool(getattr(self.sim, "trajectory_record", True)):
+            self.traj.append(
+                step=0,
+                t=0.0,
+                x=self.state.x,
+                y=self.state.y,
+                z=self.state.z,
+                vx=self.state.vx,
+                vy=self.state.vy,
+                vz=self.state.vz,
+            )
         snap_idx = 0
         # 统计
         n_nonbase_steps = 0
@@ -1211,6 +1382,18 @@ class DEMSimulator:
             t += current_dt
             step += 1
 
+            if bool(getattr(self.sim, "trajectory_record", True)) and self.traj.should_record(step):
+                self.traj.append(
+                    step=step,
+                    t=t,
+                    x=self.state.x,
+                    y=self.state.y,
+                    z=self.state.z,
+                    vx=self.state.vx,
+                    vy=self.state.vy,
+                    vz=self.state.vz,
+                )
+
         # 恢复基准步长
         self.sim.dt = self._dt_normal
         # 结束快照
@@ -1220,8 +1403,23 @@ class DEMSimulator:
         cluster_countf, coord_meanf, rg_meanf = self._cluster_metrics()
         self.report.write_step(t, KE_tf, KE_rf, KE_sumf, vmaxf, cluster_countf, coord_meanf, rg_meanf)
         elapsed = time.perf_counter() - start_time
+
+        if bool(getattr(self.sim, "trajectory_record", True)) and self.traj.last_step != step:
+            self.traj.append(
+                step=step,
+                t=t,
+                x=self.state.x,
+                y=self.state.y,
+                z=self.state.z,
+                vx=self.state.vx,
+                vy=self.state.vy,
+                vz=self.state.vz,
+            )
+
         self.report.write_runtime(elapsed)
         self.report.close()
+        if bool(getattr(self.sim, "trajectory_record", True)):
+            self.traj.close(runtime_seconds=elapsed)
         # 自适应步长统计
         if self._adaptive_enabled:
             ratio = n_nonbase_steps / max(n_total_steps, 1) * 100
