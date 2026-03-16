@@ -46,9 +46,12 @@ def main() -> None:
 
     x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_grid(init_params, materials.r)
     mass = materials.mass
+    # Initialize quaternions to identity
+    q = np.zeros((x.size, 4))
+    q[:, 0] = 1.0
     state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
                         omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
-                        mass=mass, r=materials.r)
+                        mass=mass, r=materials.r, q=q)
 
     # 盒子严格设为 N*h（可用 domain_scale 额外缩放，默认 1.0）
     L = float(init_params.N) * float(init_params.h) * float(sim.get("domain_scale", 1.0))

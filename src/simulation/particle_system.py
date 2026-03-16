@@ -16,6 +16,7 @@ class SystemState:
     omega_z: np.ndarray
     mass: float
     r: float
+    q: np.ndarray
 
     def size(self) -> int:
         return int(self.x.size)

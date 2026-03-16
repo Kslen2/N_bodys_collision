@@ -283,9 +283,11 @@ def _simulate_two_body_case(
 
     x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_two_clusters(cluster_params, materials.r)
     mass = materials.mass
+    q = np.zeros((x.size, 4), dtype=np.float64)
+    q[:, 0] = 1.0
     state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
                         omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
-                        mass=mass, r=materials.r)
+                        mass=mass, r=materials.r, q=q)
 
     x_min = float(np.min(x)); x_max = float(np.max(x))
     y_min = float(np.min(y)); y_max = float(np.max(y))
@@ -816,9 +818,11 @@ def main() -> None:
     # ----- 常规模拟：初始化两团簇并建立系统状态 -----
     x, y, z, vx, vy, vz, omega_x, omega_y, omega_z = initialize_two_clusters(cluster_params, materials.r)
     mass = materials.mass
+    q = np.zeros((x.size, 4), dtype=np.float64)
+    q[:, 0] = 1.0
     state = SystemState(x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
                         omega_x=omega_x, omega_y=omega_y, omega_z=omega_z,
-                        mass=mass, r=materials.r)
+                        mass=mass, r=materials.r, q=q)
 
     # ----- 盒子大小：按当前粒子包围盒估算并留出裕量 -----
     x_min = float(np.min(x))

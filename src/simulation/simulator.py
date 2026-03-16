@@ -30,24 +30,25 @@ try:
     from ..physics.contact.jkr_normal import JKRParams, JKRNormal
     from ..physics.contact.tangential import TangentialParams, TangentialFriction
     from ..physics.contact.rolling import RollingParams, RollingResistance
+    from ..physics.quaternion import update_orientations
     from .particle_system import SystemState
     from .contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
     from ..io.snapshot_saver import SnapshotSaver
     from ..visualization.report_generator import ReportWriter
 except ImportError:
     _HERE = os.path.abspath(os.path.dirname(__file__))
-    _PKG_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))  # multibody_collision_DEM/src → multibody_collision_DEM
-    _PROJECT_ROOT = os.path.abspath(os.path.join(_PKG_ROOT, ".."))  # dust_collision_model
+    _PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
-    from multibody_collision_DEM.src.physics.materials import Materials
-    from multibody_collision_DEM.src.physics.contact.jkr_normal import JKRParams, JKRNormal
-    from multibody_collision_DEM.src.physics.contact.tangential import TangentialParams, TangentialFriction
-    from multibody_collision_DEM.src.physics.contact.rolling import RollingParams, RollingResistance
-    from multibody_collision_DEM.src.simulation.particle_system import SystemState
-    from multibody_collision_DEM.src.simulation.contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
-    from multibody_collision_DEM.src.io.snapshot_saver import SnapshotSaver
-    from multibody_collision_DEM.src.visualization.report_generator import ReportWriter
+    from src.physics.materials import Materials
+    from src.physics.contact.jkr_normal import JKRParams, JKRNormal
+    from src.physics.contact.tangential import TangentialParams, TangentialFriction
+    from src.physics.contact.rolling import RollingParams, RollingResistance
+    from src.simulation.particle_system import SystemState
+    from src.simulation.contact_detector import NeighborParams, find_contacts, find_contacts_numba, connected_components_from_contacts, find_contacts_adaptive, find_contacts_numba_adaptive
+    from src.io.snapshot_saver import SnapshotSaver
+    from src.visualization.report_generator import ReportWriter
+    from src.physics.quaternion import update_orientations
 
 
 @dataclass
@@ -583,11 +584,19 @@ class DEMSimulator:
                 if a_contact > 0.0 and Fn != 0.0:
                     k_t = 8.0 * G_star * a_contact
                     if k_t > 0.0:
-                        # 切向位移历史 (3 components per pair)
-                        dt_hist_x = hist_in[k*3]   + vt_x * dt
-                        dt_hist_y = hist_in[k*3+1] + vt_y * dt
-                        dt_hist_z = hist_in[k*3+2] + vt_z * dt
-                        # 投影到切平面
+                        # 先把历史位移投影到当前接触平面，消除法向变化带来的历史法向分量
+                        dt_prev_x = hist_in[k*3]
+                        dt_prev_y = hist_in[k*3+1]
+                        dt_prev_z = hist_in[k*3+2]
+                        dot_prev_n = dt_prev_x * nx + dt_prev_y * ny + dt_prev_z * nz
+                        dt_prev_x -= dot_prev_n * nx
+                        dt_prev_y -= dot_prev_n * ny
+                        dt_prev_z -= dot_prev_n * nz
+
+                        # 本步切向增量更新后，再投影一次以抑制数值漂移
+                        dt_hist_x = dt_prev_x + vt_x * dt
+                        dt_hist_y = dt_prev_y + vt_y * dt
+                        dt_hist_z = dt_prev_z + vt_z * dt
                         dot_dn = dt_hist_x * nx + dt_hist_y * ny + dt_hist_z * nz
                         dt_hist_x -= dot_dn * nx
                         dt_hist_y -= dot_dn * ny
@@ -622,16 +631,17 @@ class DEMSimulator:
                             hist_out[k*3+2] = dt_hist_z
                         else:
                             F_limit_slide = MU_K * abs(F_normal_eff)
-                            if F_limit_slide > 0.0 and Ft_trial_mag > 1e-18:
-                                # 滑动方向
-                                slide_inv = 1.0 / Ft_trial_mag
-                                Ft_x = F_limit_slide * Ft_trial_x * slide_inv
-                                Ft_y = F_limit_slide * Ft_trial_y * slide_inv
-                                Ft_z = F_limit_slide * Ft_trial_z * slide_inv
-                                # 重置切向位移到库仑极限
-                                hist_out[k*3]   = -F_limit_static / k_t * Ft_trial_x * slide_inv
-                                hist_out[k*3+1] = -F_limit_static / k_t * Ft_trial_y * slide_inv
-                                hist_out[k*3+2] = -F_limit_static / k_t * Ft_trial_z * slide_inv
+                            vt_mag = _math.sqrt(vt_x * vt_x + vt_y * vt_y + vt_z * vt_z)
+                            if F_limit_slide > 0.0 and vt_mag > 1e-18:
+                                # 滑动方向沿 -vt（Thornton 标准）
+                                inv_vt = 1.0 / vt_mag
+                                Ft_x = -F_limit_slide * vt_x * inv_vt
+                                Ft_y = -F_limit_slide * vt_y * inv_vt
+                                Ft_z = -F_limit_slide * vt_z * inv_vt
+                                # 重置切向弹簧位移到库仑极限（方向同 -vt）
+                                hist_out[k*3]   = F_limit_static / k_t * vt_x * inv_vt
+                                hist_out[k*3+1] = F_limit_static / k_t * vt_y * inv_vt
+                                hist_out[k*3+2] = F_limit_static / k_t * vt_z * inv_vt
                             else:
                                 Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
                                 hist_out[k*3] = 0.0; hist_out[k*3+1] = 0.0; hist_out[k*3+2] = 0.0
@@ -648,8 +658,11 @@ class DEMSimulator:
                 fx[i] -= Fx_total; fy[i] -= Fy_total; fz[i] -= Fz_total
                 fx[j] += Fx_total; fy[j] += Fy_total; fz[j] += Fz_total
 
-                # 力矩 = -r * (n × F_t)
-                # n × F_t = (ny*Ftz - nz*Fty, nz*Ftx - nx*Ftz, nx*Fty - ny*Ftx)
+                # 按标准公式 τ = r × F_t 计算：
+                # n 定义为 i->j，当前 Ft 定义为作用在 j 上的切向力。
+                # 对 i：r_i = +r n, F_t,i = -Ft  => τ_i = (+r n) × (-Ft)
+                # 对 j：r_j = -r n, F_t,j = +Ft  => τ_j = (-r n) × (+Ft)
+                # 两者在代数上相同，均为 -r (n × Ft)。
                 torque_x = -r * (ny * Ft_z - nz * Ft_y)
                 torque_y = -r * (nz * Ft_x - nx * Ft_z)
                 torque_z = -r * (nx * Ft_y - ny * Ft_x)
@@ -925,7 +938,10 @@ class DEMSimulator:
             fx[i] -= Fx_total; fy[i] -= Fy_total; fz[i] -= Fz_total
             fx[j] += Fx_total; fy[j] += Fy_total; fz[j] += Fz_total
 
-            # 力矩 = -r * (n × F_t)
+            # 按标准公式 τ = r × F_t 计算：
+            # n 定义为 i->j，当前 Ft 定义为作用在 j 上的切向力。
+            # 对 i：r_i = +r n, F_t,i = -Ft；对 j：r_j = -r n, F_t,j = +Ft。
+            # 因而两者代数形式一致，均为 -r (n × Ft)。
             torque_x = -r * (ny * Ft_z - nz * Ft_y)
             torque_y = -r * (nz * Ft_x - nx * Ft_z)
             torque_z = -r * (nx * Ft_y - ny * Ft_x)
@@ -956,19 +972,70 @@ class DEMSimulator:
         self.state.z = (self.state.z + 0.5 * self.Lz) % self.Lz - 0.5 * self.Lz
 
     def _integrate(self, fx: np.ndarray, fy: np.ndarray, fz: np.ndarray,
-                   tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray) -> None:
+                   tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray,
+                   half_step: bool = False) -> None:
+        """Velocity-Verlet integrator."""
         dt = self.sim.dt
         m = self.state.mass
         I_p = 0.4 * m * (self.state.r ** 2)
-        self.state.vx += (fx / m) * dt
-        self.state.vy += (fy / m) * dt
-        self.state.vz += (fz / m) * dt
-        self.state.omega_x += (tau_x / I_p) * dt
-        self.state.omega_y += (tau_y / I_p) * dt
-        self.state.omega_z += (tau_z / I_p) * dt
-        self.state.x += self.state.vx * dt
-        self.state.y += self.state.vy * dt
-        self.state.z += self.state.vz * dt
+
+        ax = fx / m
+        ay = fy / m
+        az = fz / m
+        alpha_x = tau_x / I_p
+        alpha_y = tau_y / I_p
+        alpha_z = tau_z / I_p
+
+        if not half_step: # Full step update for velocity and angular velocity
+            self.state.vx += ax * dt
+            self.state.vy += ay * dt
+            self.state.vz += az * dt
+            self.state.omega_x += alpha_x * dt
+            self.state.omega_y += alpha_y * dt
+            self.state.omega_z += alpha_z * dt
+        else: # Half step for velocity, full step for position
+            # v(t + dt/2) = v(t) + a(t) * dt/2
+            self.state.vx += ax * dt * 0.5
+            self.state.vy += ay * dt * 0.5
+            self.state.vz += az * dt * 0.5
+            
+            # ω(t + dt/2) = ω(t) + α(t) * dt/2
+            self.state.omega_x += alpha_x * dt * 0.5
+            self.state.omega_y += alpha_y * dt * 0.5
+            self.state.omega_z += alpha_z * dt * 0.5
+
+            # x(t + dt) = x(t) + v(t + dt/2) * dt
+            self.state.x += self.state.vx * dt
+            self.state.y += self.state.vy * dt
+            self.state.z += self.state.vz * dt
+
+            # Update orientation q(t + dt) using ω(t + dt/2)
+            omega = np.stack([self.state.omega_x, self.state.omega_y, self.state.omega_z], axis=-1)
+            self.state.q = update_orientations(self.state.q, omega, dt)
+
+    def _update_velocities_full_step(self, fx: np.ndarray, fy: np.ndarray, fz: np.ndarray,
+                                     tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray) -> None:
+        """Second half of Velocity-Verlet for velocities."""
+        dt = self.sim.dt
+        m = self.state.mass
+        I_p = 0.4 * m * (self.state.r ** 2)
+        
+        ax = fx / m
+        ay = fy / m
+        az = fz / m
+        alpha_x = tau_x / I_p
+        alpha_y = tau_y / I_p
+        alpha_z = tau_z / I_p
+
+        # v(t + dt) = v(t + dt/2) + a(t + dt) * dt/2
+        self.state.vx += ax * dt * 0.5
+        self.state.vy += ay * dt * 0.5
+        self.state.vz += az * dt * 0.5
+        
+        # ω(t + dt) = ω(t + dt/2) + α(t + dt) * dt/2
+        self.state.omega_x += alpha_x * dt * 0.5
+        self.state.omega_y += alpha_y * dt * 0.5
+        self.state.omega_z += alpha_z * dt * 0.5
 
     def _energies(self) -> Tuple[float, float, float]:
         m = self.state.mass
@@ -1133,8 +1200,14 @@ class DEMSimulator:
                 self.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
                 next_snap += snap_dt
 
-            self._integrate(fx, fy, fz, tau_x, tau_y, tau_z)
+            # Velocity-Verlet:
+            # 1) v,w 半步推进 + x,q 全步推进
+            self._integrate(fx, fy, fz, tau_x, tau_y, tau_z, half_step=True)
             self._apply_periodic_wrap()
+            # 2) 在 t+dt 重新计算力与力矩
+            fx_new, fy_new, fz_new, tau_x_new, tau_y_new, tau_z_new, _max_abs_vn2, _min_approach_time2 = self._compute_forces()
+            # 3) 完成 v,w 的第二半步
+            self._update_velocities_full_step(fx_new, fy_new, fz_new, tau_x_new, tau_y_new, tau_z_new)
             t += current_dt
             step += 1
 
