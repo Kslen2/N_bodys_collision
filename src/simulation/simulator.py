@@ -160,6 +160,53 @@ if _NUMBA_AVAILABLE:
             d_arr[k] = _math.sqrt(dx * dx + dy * dy + dz * dz)
 
     @_njit(cache=True)
+    def _numba_encode_pair_keys(i_idx: np.ndarray, j_idx: np.ndarray,
+                                keys_out: np.ndarray) -> None:
+        """将 (i,j) 对编码为单个 int64: min(i,j) * SHIFT + max(i,j)。
+        SHIFT = 2**32，足以支持最多 40 亿个粒子。"""
+        SHIFT = np.int64(4294967296)  # 2**32
+        for k in range(i_idx.size):
+            ii = i_idx[k]; jj = j_idx[k]
+            if ii < jj:
+                keys_out[k] = ii * SHIFT + jj
+            else:
+                keys_out[k] = jj * SHIFT + ii
+
+    @_njit(cache=True)
+    def _numba_map_history(
+        new_keys: np.ndarray,
+        old_keys_sorted: np.ndarray,
+        old_sort_idx: np.ndarray,
+        old_hist: np.ndarray,
+        old_started: np.ndarray,
+        hist_in: np.ndarray,
+        started_in: np.ndarray,
+    ) -> None:
+        """在 Numba 内部用二分查找完成新接触对到旧历史的映射。"""
+        n_old = old_keys_sorted.size
+        for k in range(new_keys.size):
+            target = new_keys[k]
+            # 二分查找
+            lo = 0; hi = n_old
+            found = -1
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                val = old_keys_sorted[mid]
+                if val < target:
+                    lo = mid + 1
+                elif val > target:
+                    hi = mid
+                else:
+                    found = mid
+                    break
+            if found >= 0:
+                old_k = old_sort_idx[found]
+                hist_in[k * 3]     = old_hist[old_k * 3]
+                hist_in[k * 3 + 1] = old_hist[old_k * 3 + 1]
+                hist_in[k * 3 + 2] = old_hist[old_k * 3 + 2]
+                started_in[k]      = old_started[old_k]
+
+    @_njit(cache=True)
     def _numba_calc_one_pair_force(
         i: int, j: int, k: int,
         dxk: float, dyk: float, dzk: float, dk: float,
@@ -173,12 +220,15 @@ if _NUMBA_AVAILABLE:
         use_interp: int, alpha_min: float, alpha_max: float, dalpha: float,
         a_tab: np.ndarray, F_tab: np.ndarray,
         hist_out: np.ndarray, contacts_mask: np.ndarray,
+        # 预计算常量
+        beta_tsuji: float, F_c: float, a0: float, alpha_f: float,
+        coeff_alpha: float, G_star: float, R_eff: float, mu_eff: float,
     ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
         """
         计算单个接触对的力。
-        返回: (Fx_total, Fy_total, Fz_total, 
-               tau_xi, tau_yi, tau_zi, 
-               tau_xj, tau_yj, tau_zj, 
+        返回: (Fx_total, Fy_total, Fz_total,
+               tau_xi, tau_yi, tau_zi,
+               tau_xj, tau_yj, tau_zj,
                max_vn, min_approach)
         Fx_total... 是作用在 j 上的总力 (对 i 为负)。
         """
@@ -222,30 +272,6 @@ if _NUMBA_AVAILABLE:
                 gap = dk - 2.0 * r
                 t_contact = gap / v_approach
                 min_approach_time = t_contact
-
-        mu_eff = 0.5 * mass
-        R_eff = 0.5 * r
-
-        # 计算 beta_tsuji (可以预计算，这里为了内联方便重算)
-        e_n_clamped = e_n
-        if e_n_clamped < 1.0e-4: e_n_clamped = 1.0e-4
-        if e_n_clamped > 0.9999: e_n_clamped = 0.9999
-        loge = _math.log(e_n_clamped)
-        if loge != 0.0:
-            beta_tsuji = loge / _math.sqrt(loge * loge + _math.pi * _math.pi)
-        else:
-            beta_tsuji = 0.0
-
-        F_c = 1.5 * _math.pi * gamma * R_eff
-        # 这些常数本可以在外层计算，但内联后 Numba 可能会优化
-        # 这里为了保持接口简单，我们在内部计算，或者依赖 Numba 的常量折叠
-        # 为性能考虑，最好这些是常量。但它们来自 self.mat。
-        # 暂时保持原样。
-        a0 = ((9.0 * _math.pi * gamma * R_eff * R_eff) / E_star) ** (1.0 / 3.0)
-        alpha_f = ((3.0 * F_c * F_c) / (16.0 * R_eff * E_star * E_star)) ** (1.0 / 3.0)
-        coeff_alpha = 2.0 * _math.pi * gamma / E_star
-        E_equiv = 2.0 * E_star * (1.0 - nu * nu)
-        G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
 
         Fn = 0.0
         a_contact = 0.0
@@ -392,6 +418,28 @@ if _NUMBA_AVAILABLE:
                 max_abs_vn, min_approach_time)
 
     @_njit(cache=True)
+    def _precompute_constants(r: float, mass: float, E_star: float, gamma: float,
+                              e_n: float, nu: float):
+        """预计算在整个模拟中不变的接触力常量。"""
+        R_eff = 0.5 * r
+        mu_eff = 0.5 * mass
+        e_n_clamped = e_n
+        if e_n_clamped < 1.0e-4: e_n_clamped = 1.0e-4
+        if e_n_clamped > 0.9999: e_n_clamped = 0.9999
+        loge = _math.log(e_n_clamped)
+        if loge != 0.0:
+            beta_tsuji = loge / _math.sqrt(loge * loge + _math.pi * _math.pi)
+        else:
+            beta_tsuji = 0.0
+        F_c = 1.5 * _math.pi * gamma * R_eff
+        a0 = ((9.0 * _math.pi * gamma * R_eff * R_eff) / E_star) ** (1.0 / 3.0)
+        alpha_f = ((3.0 * F_c * F_c) / (16.0 * R_eff * E_star * E_star)) ** (1.0 / 3.0)
+        coeff_alpha = 2.0 * _math.pi * gamma / E_star
+        E_equiv = 2.0 * E_star * (1.0 - nu * nu)
+        G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
+        return beta_tsuji, F_c, a0, alpha_f, coeff_alpha, G_star, R_eff, mu_eff
+
+    @_njit(cache=True)
     def _numba_force_kernel(
         n: int,
         i_idx: np.ndarray, j_idx: np.ndarray,
@@ -415,13 +463,17 @@ if _NUMBA_AVAILABLE:
         for k in range(i_idx.size):
             contacts_mask[k] = 0.0
 
+        # 预计算常量（整个步内不变）
+        beta_tsuji, F_c, a0, alpha_f, coeff_alpha, G_star, R_eff, mu_eff = \
+            _precompute_constants(r, mass, E_star, gamma, e_n, nu)
+
         max_abs_vn = 0.0
         min_approach_time = 1e30
 
         for k in range(i_idx.size):
             i = int(i_idx[k]); j = int(j_idx[k])
             dxk = dx_arr[k]; dyk = dy_arr[k]; dzk = dz_arr[k]; dk = d_arr[k]
-            
+
             (Fx, Fy, Fz, txi, tyi, tzi, txj, tyj, tzj, mvn, mat) = _numba_calc_one_pair_force(
                 i, j, k, dxk, dyk, dzk, dk,
                 vx, vy, vz, omega_x, omega_y, omega_z,
@@ -429,14 +481,15 @@ if _NUMBA_AVAILABLE:
                 nu, MU_S, MU_K, dt, eta_c,
                 hist_in, started_in,
                 use_interp, alpha_min, alpha_max, dalpha,
-                a_tab, F_tab, hist_out, contacts_mask
+                a_tab, F_tab, hist_out, contacts_mask,
+                beta_tsuji, F_c, a0, alpha_f, coeff_alpha, G_star, R_eff, mu_eff,
             )
-            
+
             fx[i] -= Fx; fy[i] -= Fy; fz[i] -= Fz
             fx[j] += Fx; fy[j] += Fy; fz[j] += Fz
             tau_x[i] += txi; tau_y[i] += tyi; tau_z[i] += tzi
             tau_x[j] += txj; tau_y[j] += tyj; tau_z[j] += tzj
-            
+
             max_abs_vn = max(max_abs_vn, mvn)
             min_approach_time = min(min_approach_time, mat)
 
@@ -489,6 +542,10 @@ if _NUMBA_AVAILABLE:
                 fx[i]=0; fy[i]=0; fz[i]=0; tau_x[i]=0; tau_y[i]=0; tau_z[i]=0
             return 0.0, 1e30
 
+        # 预计算常量（整个步内不变）
+        beta_tsuji, F_c, a0, alpha_f, coeff_alpha, G_star, R_eff, mu_eff = \
+            _precompute_constants(r, mass, E_star, gamma, e_n, nu)
+
         chunk_size = (m + num_threads - 1) // num_threads
 
         for t in _prange(num_threads):
@@ -509,7 +566,8 @@ if _NUMBA_AVAILABLE:
                     nu, MU_S, MU_K, dt, eta_c,
                     hist_in, started_in,
                     use_interp, alpha_min, alpha_max, dalpha,
-                    a_tab, F_tab, hist_out, contacts_mask
+                    a_tab, F_tab, hist_out, contacts_mask,
+                    beta_tsuji, F_c, a0, alpha_f, coeff_alpha, G_star, R_eff, mu_eff,
                 )
 
                 fx_temp[t, i] -= Fx; fy_temp[t, i] -= Fy; fz_temp[t, i] -= Fz
@@ -625,6 +683,9 @@ class DEMSimulator:
         self._pair_hist: np.ndarray | None = None         # 与 _nbr_pairs 对齐的切向历史 (m*3,)
         self._pair_started_arr: np.ndarray | None = None  # 与 _nbr_pairs 对齐的接触标记（0/1 浮点）
         self._pair_index: Dict[Tuple[int,int], int] = {}  # (min(i,j), max(i,j)) -> 索引
+        # 数组化的接触对键（用于 Numba 二分查找映射历史）
+        self._pair_keys_sorted: np.ndarray | None = None  # 排序后的编码键 (m,) int64
+        self._pair_sort_idx: np.ndarray | None = None     # 排序索引 (m,) int64
         # outputs
         os.makedirs(self.sim.snapshot_dir, exist_ok=True)
         self.saver = SnapshotSaver(self.sim.snapshot_dir, snapshot_show_velocity=bool(getattr(self.sim, "snapshot_show_velocity", True)))
@@ -948,30 +1009,28 @@ class DEMSimulator:
                 dz_arr[:] = dz_arr_raw
                 d_arr[:] = d_arr_raw
 
-                # 使用 _pair_index + _pair_hist 数组进行快速历史查找
-                # 替代逐对 Python dict.get 循环
-                old_pair_index = self._pair_index
-                old_pair_hist = self._pair_hist
-                old_pair_started = self._pair_started_arr
-                keys: List[Tuple[int, int]] = [None] * m  # type: ignore
+                # 使用 Numba 二分查找完成历史映射（替代 Python dict.get 循环）
+                new_keys = np.empty(m, dtype=np.int64)
+                _numba_encode_pair_keys(i_idx, j_idx, new_keys)
                 hist_in[:] = 0.0
                 started_in[:] = 0.0
-                if old_pair_hist is not None and old_pair_started is not None and old_pair_index:
+                old_pair_hist = self._pair_hist
+                old_pair_started = self._pair_started_arr
+                old_keys_sorted = self._pair_keys_sorted
+                old_sort_idx = self._pair_sort_idx
+                if (old_pair_hist is not None and old_pair_started is not None
+                        and old_keys_sorted is not None and old_sort_idx is not None
+                        and old_keys_sorted.size > 0):
+                    _numba_map_history(
+                        new_keys, old_keys_sorted, old_sort_idx,
+                        old_pair_hist, old_pair_started,
+                        hist_in, started_in,
+                    )
+                elif old_pair_hist is None and self.tangential_hist:
+                    # 首步回退：从 Python dict 初始化
                     for k in range(m):
-                        i = int(i_idx[k]); j = int(j_idx[k])
-                        key = (i, j) if i < j else (j, i)
-                        keys[k] = key
-                        old_k = old_pair_index.get(key, -1)
-                        if old_k >= 0:
-                            hist_in[k*3]   = old_pair_hist[old_k*3]
-                            hist_in[k*3+1] = old_pair_hist[old_k*3+1]
-                            hist_in[k*3+2] = old_pair_hist[old_k*3+2]
-                            started_in[k]  = old_pair_started[old_k]
-                else:
-                    for k in range(m):
-                        i = int(i_idx[k]); j = int(j_idx[k])
-                        key = (i, j) if i < j else (j, i)
-                        keys[k] = key
+                        ii = int(i_idx[k]); jj = int(j_idx[k])
+                        key = (ii, jj) if ii < jj else (jj, ii)
                         h_arr = self.tangential_hist.get(key)
                         if h_arr is not None:
                             hist_in[k*3] = h_arr[0]; hist_in[k*3+1] = h_arr[1]; hist_in[k*3+2] = h_arr[2]
@@ -1011,21 +1070,23 @@ class DEMSimulator:
                     nb_max_vn, nb_min_at = _numba_force_kernel(*kern_args)
 
                 contacts_2r: List[Tuple[int, int]] = []
-                # 用 _pair_hist / _pair_started_arr / _pair_index 数组化存储历史
-                # 避免逐对创建 np.array 的开销
+                # 用数组化存储历史 + 排序键供下一步 Numba 二分查找
                 new_pair_hist = np.zeros(m * 3, dtype=np.float64)
                 new_pair_started = np.zeros(m, dtype=np.float64)
-                new_pair_index: Dict[Tuple[int,int], int] = {}
                 new_pair_hist[:m*3] = hist_out[:m*3]
                 for k in range(m):
-                    key = keys[k]
-                    new_pair_index[key] = k
                     if contacts_mask[k] > 0.5:
                         new_pair_started[k] = 1.0
+                        ii = int(i_idx[k]); jj = int(j_idx[k])
+                        key = (ii, jj) if ii < jj else (jj, ii)
                         contacts_2r.append(key)
                 self._pair_hist = new_pair_hist
                 self._pair_started_arr = new_pair_started
-                self._pair_index = new_pair_index
+                # 构建排序键供下一步二分查找
+                sort_order = np.argsort(new_keys)
+                self._pair_keys_sorted = new_keys[sort_order]
+                self._pair_sort_idx = sort_order
+                self._pair_index = {}  # 不再需要 Python dict
                 self._contacts_2r = contacts_2r
                 return fx, fy, fz, tau_x, tau_y, tau_z, float(nb_max_vn), float(nb_min_at)
 
@@ -1529,6 +1590,10 @@ class DEMSimulator:
         n_nonbase_steps = 0
         n_total_steps = 0
 
+        # Velocity-Verlet 跨步力复用：在循环开始前计算一次初始力 F(t=0)，
+        # 此后每步只需在新位置计算一次力 F(t+dt)，并将其复用为下一步的 F(t)。
+        fx, fy, fz, tau_x, tau_y, tau_z, max_abs_vn, min_approach_time = self._compute_forces()
+
         while t < self.sim.t_end:
             # ---- 自适应时间步长决策（基于当前全局最大速度） ----
             current_dt = self._dt_normal
@@ -1553,9 +1618,7 @@ class DEMSimulator:
                 if dt_factor > self._adaptive_factor_max:
                     self._adaptive_factor_max = dt_factor
 
-            fx, fy, fz, tau_x, tau_y, tau_z, max_abs_vn, min_approach_time = self._compute_forces()
-
-            # 快照与报告
+            # 快照与报告（使用已有的 F(t) 对应的 max_abs_vn）
             if t >= next_snap:
                 snap_idx += 1
                 dt_tag = "_Ldt" if is_large_dt else ""
@@ -1574,14 +1637,14 @@ class DEMSimulator:
                 self.report.write_step(t, KE_t, KE_r, KE_sum, vmax, cluster_count, coord_mean, rg_mean)
                 next_snap += snap_dt
 
-            # Velocity-Verlet:
-            # 1) v,w 半步推进 + x,q 全步推进
+            # Velocity-Verlet（跨步复用 F(t)）:
+            # 1) v,w 半步推进 + x,q 全步推进，使用已有的 F(t)
             self._integrate(fx, fy, fz, tau_x, tau_y, tau_z, half_step=True)
             self._apply_periodic_wrap()
-            # 2) 在 t+dt 重新计算力与力矩
-            fx_new, fy_new, fz_new, tau_x_new, tau_y_new, tau_z_new, _max_abs_vn2, _min_approach_time2 = self._compute_forces()
+            # 2) 在 t+dt 计算新力 F(t+dt)——这也是下一步的 F(t)
+            fx, fy, fz, tau_x, tau_y, tau_z, max_abs_vn, min_approach_time = self._compute_forces()
             # 3) 完成 v,w 的第二半步
-            self._update_velocities_full_step(fx_new, fy_new, fz_new, tau_x_new, tau_y_new, tau_z_new)
+            self._update_velocities_full_step(fx, fy, fz, tau_x, tau_y, tau_z)
             t += current_dt
             step += 1
 
