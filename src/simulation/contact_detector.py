@@ -49,7 +49,7 @@ if _NUMBA_AVAILABLE:
             dz += Lz
         return dx, dy, dz
 
-    @njit(cache=True)
+    @njit(cache=True, parallel=True)
     def _numba_wrap_periodic(x: np.ndarray, y: np.ndarray, z: np.ndarray,
                              Lx: float, Ly: float, Lz: float):
         """将坐标包裹到 [0, L)（三维）"""
@@ -60,7 +60,7 @@ if _NUMBA_AVAILABLE:
         half_Lx = 0.5 * Lx
         half_Ly = 0.5 * Ly
         half_Lz = 0.5 * Lz
-        for i in range(n):
+        for i in prange(n):
             xp[i] = (x[i] + half_Lx) % Lx
             yp[i] = (y[i] + half_Ly) % Ly
             zp[i] = (z[i] + half_Lz) % Lz
@@ -369,11 +369,11 @@ def find_contacts_numba_arrays(
         neighbor_counts = _numba_count_neighbors_parallel(
             xp, yp, zp, cell_start, cell_count, sorted_ids, Nx, Ny, Nz, Lx, Ly, Lz, thresh
         )
-        pair_offsets = np.zeros(n, dtype=np.int64)
-        total_pairs = 0
-        for i in range(n):
-            pair_offsets[i] = total_pairs
-            total_pairs += neighbor_counts[i]
+        pair_offsets = np.empty(n, dtype=np.int64)
+        pair_offsets[0] = 0
+        if n > 1:
+            np.cumsum(neighbor_counts[:-1], out=pair_offsets[1:])
+        total_pairs = int(pair_offsets[-1] + neighbor_counts[-1]) if n > 0 else 0
         if total_pairs == 0:
             return (
                 np.empty(0, dtype=np.int64),
@@ -555,7 +555,7 @@ if _NUMBA_AVAILABLE:
             h += np.int64(table_size)
         return h
 
-    @njit(cache=True)
+    @njit(cache=True, parallel=True)
     def _numba_build_hash_grid(xp: np.ndarray, yp: np.ndarray, zp: np.ndarray,
                                 Nx: int, Ny: int, Nz: int,
                                 Lx: float, Ly: float, Lz: float,
@@ -568,7 +568,8 @@ if _NUMBA_AVAILABLE:
         cell_x = Lx / Nx
         cell_y = Ly / Ny
         cell_z = Lz / Nz
-        for i in range(n):
+        # 第1遍：cell assignment（并行，每个 i 写独立位置，无竞争）
+        for i in prange(n):
             gx = int(xp[i] / cell_x) % Nx
             gy = int(yp[i] / cell_y) % Ny
             gz = int(zp[i] / cell_z) % Nz
@@ -576,6 +577,7 @@ if _NUMBA_AVAILABLE:
             gy_arr[i] = gy
             gz_arr[i] = gz
             hashes[i] = _numba_spatial_hash(gx, gy, gz, table_size)
+        # 第2遍~第4遍：counting sort（串行，有数据依赖）
         hash_count = np.zeros(table_size, dtype=np.int64)
         for i in range(n):
             hash_count[hashes[i]] += 1
@@ -826,11 +828,11 @@ def find_contacts_numba_adaptive_arrays(
             xp, yp, zp, hash_start, hash_count, sorted_ids, gx_arr, gy_arr, gz_arr,
             Nx, Ny, Nz, Lx, Ly, Lz, table_size, thresh
         )
-        pair_offsets = np.zeros(n, dtype=np.int64)
-        total_pairs = 0
-        for i in range(n):
-            pair_offsets[i] = total_pairs
-            total_pairs += neighbor_counts[i]
+        pair_offsets = np.empty(n, dtype=np.int64)
+        pair_offsets[0] = 0
+        if n > 1:
+            np.cumsum(neighbor_counts[:-1], out=pair_offsets[1:])
+        total_pairs = int(pair_offsets[-1] + neighbor_counts[-1]) if n > 0 else 0
         if total_pairs == 0:
             return (
                 np.empty(0, dtype=np.int64),

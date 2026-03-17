@@ -502,7 +502,7 @@ if __name__ == '__main__':
     import argparse
     import os
 
-    DEFAULT_FOLDER = 'data/N10_2.5e-10dt_10e-5_verlet3_h54'
+    DEFAULT_FOLDER = 'data/N10_2.5e-10dt_10e-5_verlet1_h70'
     DEFAULT_FILENAME = 'trajectory.h5'
 
     parser = argparse.ArgumentParser(description='Interactive 3D Trajectory Player')

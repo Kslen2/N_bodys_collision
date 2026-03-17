@@ -29,11 +29,16 @@ def main() -> None:
     args = parse_args()
     cfg_path = os.path.abspath(args.config)
     with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     mtl = cfg.get("materials", {})
     ini = cfg.get("initialization", {})
     sim = cfg.get("simulation", {})
+    
+    # 强制启用 numba parallel（如果yaml没写）
+    if "use_numba_parallel" not in sim:
+        sim["use_numba_parallel"] = True
+
 
     materials = Materials(
         r=float(mtl["r"]), rho=float(mtl["rho"]), E=float(mtl["E"]), nu=float(mtl["nu"]), gamma=float(mtl["gamma"]),
@@ -60,8 +65,8 @@ def main() -> None:
         snapshot_interval=float(sim.get("snapshot_interval", 0.0)), save_stride=int(sim.get("save_stride", 1)),
         snapshot_dir=str(sim.get("snapshot_dir", "data/snapshot_saver")), domain_scale=float(sim.get("domain_scale", 1.0)),
         Lx=L, Ly=L, Lz=L,
-        use_numba=bool(sim.get("use_numba", args.numba)),
-        use_numba_parallel=bool(sim.get("use_numba_parallel", False)),
+        use_numba=bool(sim.get("use_numba", True)),
+        use_numba_parallel=bool(sim.get("use_numba_parallel", True)),
         snapshot_show_velocity=bool(sim.get("snapshot_show_velocity", True)),
         snapshot_show_dt_factor=bool(sim.get("snapshot_show_dt_factor", False)),
         use_cpp=bool(sim.get("use_cpp", False)),

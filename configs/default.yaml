@@ -19,16 +19,16 @@ initialization:
 
 simulation:
   dt: 2.5e-10        # 时间步 (s)
-  t_end: 50e-5      # 总时长 (s)
+  t_end: 10e-5      # 总时长 (s)
   skin_factor: 0.2   # 邻域skin厚度占 r 的比例 (r_cut=2r+skin)
   snapshot_interval: 1e-5   # 快照间隔 (s)
   save_stride: 1     # 报告步长：每步都写或按 stride 写
-  snapshot_dir: "data/N10_2.5e-10dt_50e-5_verlet3_h54"  # 默认不开启并行
+  snapshot_dir: "data/N10_2.5e-10dt_10e-5_verlet1_h70"  # 默认不开启并行
   snapshot_show_velocity: false  # 快照是否绘制速度信息（速度箭头 + 最快颗粒标注）
   snapshot_show_dt_factor: true  # 快照左下角是否显示当前步长倍率
   domain_scale: 1.0  # 盒子大小相对 N*h 的缩放 (1.0 表示 L=N*h)
   use_numba: true    # 是否启用 Numba 加速
-  use_numba_parallel: false  # 是否启用 Numba 多线程并行（prange）
+  use_numba_parallel: true  # 是否启用 Numba 多线程并行（prange）
   use_cpp: false      # 是否启用 C++ pybind11 内核（需先构建并安装）
   use_neighbor_cache: true  # 是否启用邻域缓存（Verlet 邻居）
   use_adaptive_grid: true  # 是否启用自适应动态网格（四叉树/空间哈希，适合非均匀分布）

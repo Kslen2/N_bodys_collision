@@ -113,11 +113,455 @@ class SimParams:
     trajectory_filename: str = "trajectory.h5"
 
 
+# ============================================================
+# Numba Kernels (Module Level)
+# ============================================================
+@_njit(cache=True)
+def _numba_minimal_image(dx: float, dy: float, dz: float, 
+                      Lx: float, Ly: float, Lz: float):
+    # 手动 inline 以确保一致性
+    if dx > 0.5 * Lx: dx -= Lx
+    elif dx < -0.5 * Lx: dx += Lx
+    if dy > 0.5 * Ly: dy -= Ly
+    elif dy < -0.5 * Ly: dy += Ly
+    if dz > 0.5 * Lz: dz -= Lz
+    elif dz < -0.5 * Lz: dz += Lz
+    return dx, dy, dz
+
+if _NUMBA_AVAILABLE:
+    @_njit(cache=True, parallel=True)
+    def _numba_build_geometry_from_idx(
+        x: np.ndarray,
+        y: np.ndarray,
+        z: np.ndarray,
+        Lx: float,
+        Ly: float,
+        Lz: float,
+        i_idx: np.ndarray,
+        j_idx: np.ndarray,
+        dx_arr: np.ndarray,
+        dy_arr: np.ndarray,
+        dz_arr: np.ndarray,
+        d_arr: np.ndarray,
+    ) -> None:
+        """根据 (i,j) 索引，在 Numba 内部计算 dx, dy, dz, d（含周期最小镜像）。"""
+        m = i_idx.size
+        for k in _prange(m):
+            i = int(i_idx[k]); j = int(j_idx[k])
+            dx = x[j] - x[i]
+            dy = y[j] - y[i]
+            dz = z[j] - z[i]
+
+            dx, dy, dz = _numba_minimal_image(dx, dy, dz, Lx, Ly, Lz)
+
+            dx_arr[k] = dx
+            dy_arr[k] = dy
+            dz_arr[k] = dz
+            d_arr[k] = _math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    @_njit(cache=True)
+    def _numba_calc_one_pair_force(
+        i: int, j: int, k: int,
+        dxk: float, dyk: float, dzk: float, dk: float,
+        vx: np.ndarray, vy: np.ndarray, vz: np.ndarray,
+        omega_x: np.ndarray, omega_y: np.ndarray, omega_z: np.ndarray,
+        r: float, mass: float,
+        E_star: float, gamma: float, e_n: float, mu_r: float,
+        nu: float, MU_S: float, MU_K: float,
+        dt: float, eta_c: float,
+        hist_in: np.ndarray, started_in: np.ndarray,
+        use_interp: int, alpha_min: float, alpha_max: float, dalpha: float,
+        a_tab: np.ndarray, F_tab: np.ndarray,
+        hist_out: np.ndarray, contacts_mask: np.ndarray,
+    ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
+        """
+        计算单个接触对的力。
+        返回: (Fx_total, Fy_total, Fz_total, 
+               tau_xi, tau_yi, tau_zi, 
+               tau_xj, tau_yj, tau_zj, 
+               max_vn, min_approach)
+        Fx_total... 是作用在 j 上的总力 (对 i 为负)。
+        """
+        Fx_total = 0.0; Fy_total = 0.0; Fz_total = 0.0
+        tau_xi = 0.0; tau_yi = 0.0; tau_zi = 0.0
+        tau_xj = 0.0; tau_yj = 0.0; tau_zj = 0.0
+        max_abs_vn = 0.0
+        min_approach_time = 1e30
+
+        inv_d = 1.0 / (dk + 1e-18)
+        nx = dxk * inv_d
+        ny = dyk * inv_d
+        nz = dzk * inv_d
+        delta_n = 2.0 * r - dk
+
+        # 相对速度
+        dvx = vx[j] - vx[i]
+        dvy = vy[j] - vy[i]
+        dvz = vz[j] - vz[i]
+        v_rel_n = dvx * nx + dvy * ny + dvz * nz
+
+        # 接触点相对速度 = v_rel - r*(ω_i + ω_j) × n
+        wx = omega_x[i] + omega_x[j]
+        wy = omega_y[i] + omega_y[j]
+        wz = omega_z[i] + omega_z[j]
+        cross_x = wy * nz - wz * ny
+        cross_y = wz * nx - wx * nz
+        cross_z = wx * ny - wy * nx
+
+        vt_x = dvx - v_rel_n * nx - r * cross_x
+        vt_y = dvy - v_rel_n * ny - r * cross_y
+        vt_z = dvz - v_rel_n * nz - r * cross_z
+
+        started = started_in[k] > 0.5
+
+        if delta_n > 0.0 or started:
+            max_abs_vn = abs(v_rel_n)
+        else:
+            v_approach = -v_rel_n
+            if v_approach > 1e-18:
+                gap = dk - 2.0 * r
+                t_contact = gap / v_approach
+                min_approach_time = t_contact
+
+        mu_eff = 0.5 * mass
+        R_eff = 0.5 * r
+
+        # 计算 beta_tsuji (可以预计算，这里为了内联方便重算)
+        e_n_clamped = e_n
+        if e_n_clamped < 1.0e-4: e_n_clamped = 1.0e-4
+        if e_n_clamped > 0.9999: e_n_clamped = 0.9999
+        loge = _math.log(e_n_clamped)
+        if loge != 0.0:
+            beta_tsuji = loge / _math.sqrt(loge * loge + _math.pi * _math.pi)
+        else:
+            beta_tsuji = 0.0
+
+        F_c = 1.5 * _math.pi * gamma * R_eff
+        # 这些常数本可以在外层计算，但内联后 Numba 可能会优化
+        # 这里为了保持接口简单，我们在内部计算，或者依赖 Numba 的常量折叠
+        # 为性能考虑，最好这些是常量。但它们来自 self.mat。
+        # 暂时保持原样。
+        a0 = ((9.0 * _math.pi * gamma * R_eff * R_eff) / E_star) ** (1.0 / 3.0)
+        alpha_f = ((3.0 * F_c * F_c) / (16.0 * R_eff * E_star * E_star)) ** (1.0 / 3.0)
+        coeff_alpha = 2.0 * _math.pi * gamma / E_star
+        E_equiv = 2.0 * E_star * (1.0 - nu * nu)
+        G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
+
+        Fn = 0.0
+        a_contact = 0.0
+
+        if delta_n > -alpha_f:
+            if delta_n < 0.0 and (not started):
+                Fn = 0.0; a_contact = 0.0
+            else:
+                F_elastic = 0.0
+                used_interp = False
+                if use_interp == 1:
+                    if (delta_n > alpha_min) and (delta_n < alpha_max):
+                        t_alpha = (delta_n - alpha_min) / dalpha
+                        idx = int(t_alpha)
+                        n_tab = a_tab.size
+                        if idx < 0: idx = 0; frac = 0.0
+                        elif idx >= n_tab - 1: idx = n_tab - 2; frac = 1.0
+                        else: frac = t_alpha - idx
+                        a_interp = a_tab[idx] + (a_tab[idx + 1] - a_tab[idx]) * frac
+                        F_elastic = F_tab[idx] + (F_tab[idx + 1] - F_tab[idx]) * frac
+                        if a_interp > 0.0 and F_elastic != 0.0:
+                            a_contact = a_interp; used_interp = True
+
+                if not used_interp:
+                    if delta_n >= 0.0:
+                        a_init = _math.sqrt(R_eff * max(delta_n, 1e-18))
+                        a = max(a_init, 0.5 * a0)
+                    else:
+                        a = a0
+                    
+                    for _iter in range(20):
+                        alpha_model = (a * a) / R_eff - _math.sqrt(coeff_alpha * a)
+                        f_newt = alpha_model - delta_n
+                        if abs(f_newt) < 1e-12 * max(1.0, abs(delta_n)): break
+                        d_alpha_da = 2.0 * a / R_eff - 0.5 * _math.sqrt(coeff_alpha / max(a, 1e-30))
+                        if abs(d_alpha_da) < 1e-30: break
+                        a_new = a - f_newt / d_alpha_da
+                        if a_new <= 0.0: a_new = 0.5 * a
+                        a = min(a_new, 10.0 * a0)
+                    
+                    if a > 0.0:
+                        a_contact = a
+                        a3 = a * a * a
+                        F_hertz = (4.0 * E_star * a3) / (3.0 * R_eff)
+                        F_adhesion = _math.sqrt(8.0 * _math.pi * gamma * E_star * a3)
+                        F_elastic = F_hertz - F_adhesion
+
+                if a_contact > 0.0:
+                    k_n = 2.0 * E_star * a_contact
+                    if beta_tsuji != 0.0 and k_n > 0.0:
+                        eta_n = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(mu_eff * k_n, 1e-18))
+                        F_damping = -eta_n * v_rel_n
+                    else:
+                        F_damping = 0.0
+                    Fn = F_elastic + F_damping
+                else:
+                    Fn = 0.0
+        else:
+            Fn = 0.0; a_contact = 0.0
+
+        # 切向力
+        Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
+        if a_contact > 0.0 and Fn != 0.0:
+            k_t = 8.0 * G_star * a_contact
+            if k_t > 0.0:
+                dt_prev_x = hist_in[k*3]; dt_prev_y = hist_in[k*3+1]; dt_prev_z = hist_in[k*3+2]
+                dot_prev_n = dt_prev_x * nx + dt_prev_y * ny + dt_prev_z * nz
+                dt_prev_x -= dot_prev_n * nx; dt_prev_y -= dot_prev_n * ny; dt_prev_z -= dot_prev_n * nz
+
+                dt_hist_x = dt_prev_x + vt_x * dt
+                dt_hist_y = dt_prev_y + vt_y * dt
+                dt_hist_z = dt_prev_z + vt_z * dt
+                dot_dn = dt_hist_x * nx + dt_hist_y * ny + dt_hist_z * nz
+                dt_hist_x -= dot_dn * nx; dt_hist_y -= dot_dn * ny; dt_hist_z -= dot_dn * nz
+
+                F_ct_x = -k_t * dt_hist_x; F_ct_y = -k_t * dt_hist_y; F_ct_z = -k_t * dt_hist_z
+
+                if beta_tsuji != 0.0:
+                    eta_t = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(k_t * mu_eff, 1.0e-18))
+                    F_dt_x = -eta_t * vt_x; F_dt_y = -eta_t * vt_y; F_dt_z = -eta_t * vt_z
+                else:
+                    F_dt_x = 0.0; F_dt_y = 0.0; F_dt_z = 0.0
+
+                Ft_trial_x = F_ct_x + F_dt_x
+                Ft_trial_y = F_ct_y + F_dt_y
+                Ft_trial_z = F_ct_z + F_dt_z
+                Ft_trial_mag = _math.sqrt(Ft_trial_x**2 + Ft_trial_y**2 + Ft_trial_z**2)
+
+                F_normal_eff = Fn + 2.0 * F_c
+                F_limit_static = MU_S * abs(F_normal_eff)
+
+                if Ft_trial_mag <= F_limit_static:
+                    Ft_x = Ft_trial_x; Ft_y = Ft_trial_y; Ft_z = Ft_trial_z
+                    hist_out[k*3] = dt_hist_x; hist_out[k*3+1] = dt_hist_y; hist_out[k*3+2] = dt_hist_z
+                else:
+                    F_limit_slide = MU_K * abs(F_normal_eff)
+                    vt_mag = _math.sqrt(vt_x * vt_x + vt_y * vt_y + vt_z * vt_z)
+                    if F_limit_slide > 0.0 and vt_mag > 1e-18:
+                        inv_vt = 1.0 / vt_mag
+                        Ft_x = -F_limit_slide * vt_x * inv_vt
+                        Ft_y = -F_limit_slide * vt_y * inv_vt
+                        Ft_z = -F_limit_slide * vt_z * inv_vt
+                        hist_out[k*3]   = F_limit_static / k_t * vt_x * inv_vt
+                        hist_out[k*3+1] = F_limit_static / k_t * vt_y * inv_vt
+                        hist_out[k*3+2] = F_limit_static / k_t * vt_z * inv_vt
+                    else:
+                        Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
+                        hist_out[k*3] = 0.0; hist_out[k*3+1] = 0.0; hist_out[k*3+2] = 0.0
+                contacts_mask[k] = 1.0
+            else:
+                hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
+        else:
+            hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
+
+        Fx_total = Fn * nx + Ft_x
+        Fy_total = Fn * ny + Ft_y
+        Fz_total = Fn * nz + Ft_z
+        
+        # Torque
+        torque_x = -r * (ny * Ft_z - nz * Ft_y)
+        torque_y = -r * (nz * Ft_x - nx * Ft_z)
+        torque_z = -r * (nx * Ft_y - ny * Ft_x)
+        tau_xi += torque_x; tau_yi += torque_y; tau_zi += torque_z
+        tau_xj += torque_x; tau_yj += torque_y; tau_zj += torque_z
+
+        if delta_n > 0.0:
+            T_roll = mu_r * abs(Fn) * r
+            oi_mag = _math.sqrt(omega_x[i]**2 + omega_y[i]**2 + omega_z[i]**2)
+            if oi_mag > 1e-18:
+                inv_oi = 1.0 / oi_mag
+                tau_xi -= T_roll * omega_x[i] * inv_oi
+                tau_yi -= T_roll * omega_y[i] * inv_oi
+                tau_zi -= T_roll * omega_z[i] * inv_oi
+            oj_mag = _math.sqrt(omega_x[j]**2 + omega_y[j]**2 + omega_z[j]**2)
+            if oj_mag > 1e-18:
+                inv_oj = 1.0 / oj_mag
+                tau_xj -= T_roll * omega_x[j] * inv_oj
+                tau_yj -= T_roll * omega_y[j] * inv_oj
+                tau_zj -= T_roll * omega_z[j] * inv_oj
+        
+        return (Fx_total, Fy_total, Fz_total, 
+                tau_xi, tau_yi, tau_zi, 
+                tau_xj, tau_yj, tau_zj, 
+                max_abs_vn, min_approach_time)
+
+    @_njit(cache=True)
+    def _numba_force_kernel(
+        n: int,
+        i_idx: np.ndarray, j_idx: np.ndarray,
+        dx_arr: np.ndarray, dy_arr: np.ndarray, dz_arr: np.ndarray, d_arr: np.ndarray,
+        vx: np.ndarray, vy: np.ndarray, vz: np.ndarray,
+        omega_x: np.ndarray, omega_y: np.ndarray, omega_z: np.ndarray,
+        r: float, mass: float,
+        E_star: float, gamma: float, e_n: float, mu_r: float,
+        nu: float, MU_S: float, MU_K: float,
+        dt: float, eta_c: float,
+        hist_in: np.ndarray, started_in: np.ndarray,
+        use_interp: int, alpha_min: float, alpha_max: float, dalpha: float,
+        a_tab: np.ndarray, F_tab: np.ndarray,
+        fx: np.ndarray, fy: np.ndarray, fz: np.ndarray,
+        tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray,
+        hist_out: np.ndarray, contacts_mask: np.ndarray,
+    ) -> tuple[float, float]:
+        for i in range(n):
+            fx[i] = 0.0; fy[i] = 0.0; fz[i] = 0.0
+            tau_x[i] = 0.0; tau_y[i] = 0.0; tau_z[i] = 0.0
+        for k in range(i_idx.size):
+            contacts_mask[k] = 0.0
+
+        max_abs_vn = 0.0
+        min_approach_time = 1e30
+
+        for k in range(i_idx.size):
+            i = int(i_idx[k]); j = int(j_idx[k])
+            dxk = dx_arr[k]; dyk = dy_arr[k]; dzk = dz_arr[k]; dk = d_arr[k]
+            
+            (Fx, Fy, Fz, txi, tyi, tzi, txj, tyj, tzj, mvn, mat) = _numba_calc_one_pair_force(
+                i, j, k, dxk, dyk, dzk, dk,
+                vx, vy, vz, omega_x, omega_y, omega_z,
+                r, mass, E_star, gamma, e_n, mu_r,
+                nu, MU_S, MU_K, dt, eta_c,
+                hist_in, started_in,
+                use_interp, alpha_min, alpha_max, dalpha,
+                a_tab, F_tab, hist_out, contacts_mask
+            )
+            
+            fx[i] -= Fx; fy[i] -= Fy; fz[i] -= Fz
+            fx[j] += Fx; fy[j] += Fy; fz[j] += Fz
+            tau_x[i] += txi; tau_y[i] += tyi; tau_z[i] += tzi
+            tau_x[j] += txj; tau_y[j] += tyj; tau_z[j] += tzj
+            
+            max_abs_vn = max(max_abs_vn, mvn)
+            min_approach_time = min(min_approach_time, mat)
+
+        return max_abs_vn, min_approach_time
+
+    @_njit(cache=True, parallel=True)
+    def _numba_force_kernel_parallel(
+        num_threads: int,
+        n: int,
+        i_idx: np.ndarray, j_idx: np.ndarray,
+        dx_arr: np.ndarray, dy_arr: np.ndarray, dz_arr: np.ndarray, d_arr: np.ndarray,
+        vx: np.ndarray, vy: np.ndarray, vz: np.ndarray,
+        omega_x: np.ndarray, omega_y: np.ndarray, omega_z: np.ndarray,
+        r: float, mass: float,
+        E_star: float, gamma: float, e_n: float, mu_r: float,
+        nu: float, MU_S: float, MU_K: float,
+        dt: float, eta_c: float,
+        hist_in: np.ndarray, started_in: np.ndarray,
+        use_interp: int, alpha_min: float, alpha_max: float, dalpha: float,
+        a_tab: np.ndarray, F_tab: np.ndarray,
+        fx: np.ndarray, fy: np.ndarray, fz: np.ndarray,
+        tau_x: np.ndarray, tau_y: np.ndarray, tau_z: np.ndarray,
+        hist_out: np.ndarray, contacts_mask: np.ndarray,
+        fx_temp: np.ndarray, fy_temp: np.ndarray, fz_temp: np.ndarray,
+        tx_temp: np.ndarray, ty_temp: np.ndarray, tz_temp: np.ndarray,
+        mvn_temp: np.ndarray, mat_temp: np.ndarray,
+    ) -> tuple[float, float]:
+        # 并行计算：避免竞争
+        # 使用外部预分配的线程私有力累加数组 + 手动块划分
+
+        # 归零线程私有缓冲区（并行安全：每个 (t,i) 唯一）
+        for t in _prange(num_threads):
+            for i in range(n):
+                fx_temp[t, i] = 0.0
+                fy_temp[t, i] = 0.0
+                fz_temp[t, i] = 0.0
+                tx_temp[t, i] = 0.0
+                ty_temp[t, i] = 0.0
+                tz_temp[t, i] = 0.0
+            mvn_temp[t] = 0.0
+            mat_temp[t] = 1e30
+
+        # 归零 contacts_mask (parallel safe because each k unique)
+        for k in _prange(i_idx.size):
+            contacts_mask[k] = 0.0
+
+        m = i_idx.size
+        if m == 0:
+            for i in _prange(n):
+                fx[i]=0; fy[i]=0; fz[i]=0; tau_x[i]=0; tau_y[i]=0; tau_z[i]=0
+            return 0.0, 1e30
+
+        chunk_size = (m + num_threads - 1) // num_threads
+
+        for t in _prange(num_threads):
+            start = t * chunk_size
+            end = min(start + chunk_size, m)
+
+            local_mvn = 0.0
+            local_mat = 1e30
+
+            for k in range(start, end):
+                i = int(i_idx[k]); j = int(j_idx[k])
+                dxk = dx_arr[k]; dyk = dy_arr[k]; dzk = dz_arr[k]; dk = d_arr[k]
+
+                (Fx, Fy, Fz, txi, tyi, tzi, txj, tyj, tzj, mvn, mat) = _numba_calc_one_pair_force(
+                    i, j, k, dxk, dyk, dzk, dk,
+                    vx, vy, vz, omega_x, omega_y, omega_z,
+                    r, mass, E_star, gamma, e_n, mu_r,
+                    nu, MU_S, MU_K, dt, eta_c,
+                    hist_in, started_in,
+                    use_interp, alpha_min, alpha_max, dalpha,
+                    a_tab, F_tab, hist_out, contacts_mask
+                )
+
+                fx_temp[t, i] -= Fx; fy_temp[t, i] -= Fy; fz_temp[t, i] -= Fz
+                fx_temp[t, j] += Fx; fy_temp[t, j] += Fy; fz_temp[t, j] += Fz
+                tx_temp[t, i] += txi; ty_temp[t, i] += tyi; tz_temp[t, i] += tzi
+                tx_temp[t, j] += txj; ty_temp[t, j] += tyj; tz_temp[t, j] += tzj
+
+                local_mvn = max(local_mvn, mvn)
+                local_mat = min(local_mat, mat)
+
+            mvn_temp[t] = local_mvn
+            mat_temp[t] = local_mat
+
+        # Reduction (parallel over particles)
+        for i in _prange(n):
+            sum_fx = 0.0; sum_fy = 0.0; sum_fz = 0.0
+            sum_tx = 0.0; sum_ty = 0.0; sum_tz = 0.0
+            for t in range(num_threads):
+                sum_fx += fx_temp[t, i]
+                sum_fy += fy_temp[t, i]
+                sum_fz += fz_temp[t, i]
+                sum_tx += tx_temp[t, i]
+                sum_ty += ty_temp[t, i]
+                sum_tz += tz_temp[t, i]
+            fx[i] = sum_fx; fy[i] = sum_fy; fz[i] = sum_fz
+            tau_x[i] = sum_tx; tau_y[i] = sum_ty; tau_z[i] = sum_tz
+
+        return np.max(mvn_temp), np.min(mat_temp)
+
+
 class DEMSimulator:
     def __init__(self, materials: Materials, sim: SimParams, state: SystemState) -> None:
         self.mat = materials
         self.sim = sim
         self.state = state
+        # 安全设置 Numba 并行线程数，确保和外部环境一致，避免资源竞争
+        self._num_threads = 4
+        if _NUMBA_AVAILABLE:
+            try:
+                import os
+                # 尝试从环境变量获取
+                env_threads = os.environ.get("OMP_NUM_THREADS") or os.environ.get("NUMBA_NUM_THREADS")
+                if env_threads:
+                    self._num_threads = int(env_threads)
+                else:
+                    self._num_threads = int(_nb.config.NUMBA_DEFAULT_NUM_THREADS)
+                if self._num_threads < 1:
+                   self._num_threads = 1
+            except Exception:
+                import os as _os_fallback
+                self._num_threads = max(1, _os_fallback.cpu_count() or 4)
+
         # domain: 优先使用外部传入的 Lx/Ly/Lz，否则按位置估算并乘以 domain_scale
         if (self.sim.Lx is not None) and (self.sim.Ly is not None) and (self.sim.Lz is not None):
             self.Lx = float(self.sim.Lx)
@@ -244,6 +688,17 @@ class DEMSimulator:
         self._nb_started_in = None
         self._nb_hist_out = None
         self._nb_contacts_mask = None
+        # 并行力核心线程私有缓冲区
+        self._par_buf_n = 0
+        self._par_buf_nt = 0
+        self._nb_fx_temp = None
+        self._nb_fy_temp = None
+        self._nb_fz_temp = None
+        self._nb_tx_temp = None
+        self._nb_ty_temp = None
+        self._nb_tz_temp = None
+        self._nb_mvn_temp = None
+        self._nb_mat_temp = None
 
     def _ensure_nb_buf(self, m: int) -> None:
         if not _NUMBA_AVAILABLE:
@@ -262,6 +717,24 @@ class DEMSimulator:
         self._nb_hist_out = np.empty(new_cap * 3, dtype=np.float64)
         self._nb_contacts_mask = np.empty(new_cap, dtype=np.float64)
         self._nbuf_capacity = new_cap
+
+    def _ensure_parallel_buf(self, n: int) -> None:
+        """预分配力核心并行缓冲区（线程私有力/力矩及归约临时数组）。"""
+        if not _NUMBA_AVAILABLE:
+            return
+        nt = self._num_threads
+        if self._par_buf_n >= n and self._par_buf_nt >= nt:
+            return
+        self._par_buf_n = n
+        self._par_buf_nt = nt
+        self._nb_fx_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_fy_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_fz_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_tx_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_ty_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_tz_temp = np.zeros((nt, n), dtype=np.float64)
+        self._nb_mvn_temp = np.zeros(nt, dtype=np.float64)
+        self._nb_mat_temp = np.full(nt, 1e30, dtype=np.float64)
 
     # ------------------------------
     # 邻域缓存（Verlet 邻居）
@@ -388,349 +861,7 @@ class DEMSimulator:
         self._nbr_query_steps += 1
         return self._nbr_pairs or []
 
-    # ------------------------------
-    # Numba 并行力计算内核（可选）
-    # ------------------------------
-    if _NUMBA_AVAILABLE:
-        @_njit(cache=True)
-        def _numba_build_geometry_from_idx(
-            x: np.ndarray,
-            y: np.ndarray,
-            z: np.ndarray,
-            Lx: float,
-            Ly: float,
-            Lz: float,
-            i_idx: np.ndarray,
-            j_idx: np.ndarray,
-            dx_arr: np.ndarray,
-            dy_arr: np.ndarray,
-            dz_arr: np.ndarray,
-            d_arr: np.ndarray,
-        ) -> None:
-            """根据 (i,j) 索引，在 Numba 内部计算 dx, dy, dz, d（含周期最小镜像）。"""
-            m = i_idx.size
-            half_x = 0.5 * Lx
-            half_y = 0.5 * Ly
-            half_z = 0.5 * Lz
-            for k in range(m):
-                i = int(i_idx[k]); j = int(j_idx[k])
-                dx = x[j] - x[i]
-                dy = y[j] - y[i]
-                dz = z[j] - z[i]
-                if dx > half_x:
-                    dx -= Lx
-                elif dx < -half_x:
-                    dx += Lx
-                if dy > half_y:
-                    dy -= Ly
-                elif dy < -half_y:
-                    dy += Ly
-                if dz > half_z:
-                    dz -= Lz
-                elif dz < -half_z:
-                    dz += Lz
-                dx_arr[k] = dx
-                dy_arr[k] = dy
-                dz_arr[k] = dz
-                d_arr[k] = _math.sqrt(dx * dx + dy * dy + dz * dz)
 
-        @_njit(cache=True)
-        def _numba_force_kernel(
-            n: int,
-            i_idx: np.ndarray,
-            j_idx: np.ndarray,
-            dx_arr: np.ndarray,
-            dy_arr: np.ndarray,
-            dz_arr: np.ndarray,
-            d_arr: np.ndarray,
-            vx: np.ndarray,
-            vy: np.ndarray,
-            vz: np.ndarray,
-            omega_x: np.ndarray,
-            omega_y: np.ndarray,
-            omega_z: np.ndarray,
-            r: float,
-            mass: float,
-            E_star: float,
-            gamma: float,
-            e_n: float,
-            mu_r: float,
-            nu: float,
-            MU_S: float,
-            MU_K: float,
-            dt: float,
-            eta_c: float,
-            hist_in: np.ndarray,
-            started_in: np.ndarray,
-            use_interp: int,
-            alpha_min: float,
-            alpha_max: float,
-            dalpha: float,
-            a_tab: np.ndarray,
-            F_tab: np.ndarray,
-            fx: np.ndarray,
-            fy: np.ndarray,
-            fz: np.ndarray,
-            tau_x: np.ndarray,
-            tau_y: np.ndarray,
-            tau_z: np.ndarray,
-            hist_out: np.ndarray,
-            contacts_mask: np.ndarray,
-        ) -> tuple[float, float]:
-            for i in range(n):
-                fx[i] = 0.0
-                fy[i] = 0.0
-                fz[i] = 0.0
-                tau_x[i] = 0.0
-                tau_y[i] = 0.0
-                tau_z[i] = 0.0
-            for k in range(i_idx.size):
-                contacts_mask[k] = 0.0
-
-            max_abs_vn = 0.0
-            min_approach_time = 1e30
-            mu_eff = 0.5 * mass
-            R_eff = 0.5 * r
-
-            e_n_clamped = e_n
-            if e_n_clamped < 1.0e-4:
-                e_n_clamped = 1.0e-4
-            if e_n_clamped > 0.9999:
-                e_n_clamped = 0.9999
-            loge = _math.log(e_n_clamped)
-            if loge != 0.0:
-                beta_tsuji = loge / _math.sqrt(loge * loge + _math.pi * _math.pi)
-            else:
-                beta_tsuji = 0.0
-
-            F_c = 1.5 * _math.pi * gamma * R_eff
-            a0 = ((9.0 * _math.pi * gamma * R_eff * R_eff) / E_star) ** (1.0 / 3.0)
-            alpha_f = ((3.0 * F_c * F_c) / (16.0 * R_eff * E_star * E_star)) ** (1.0 / 3.0)
-            coeff_alpha = 2.0 * _math.pi * gamma / E_star
-            E_equiv = 2.0 * E_star * (1.0 - nu * nu)
-            G_star = E_equiv / (4.0 * (2.0 - nu) * (1.0 + nu))
-
-            for k in range(i_idx.size):
-                i = int(i_idx[k]); j = int(j_idx[k])
-                dxk = dx_arr[k]; dyk = dy_arr[k]; dzk = dz_arr[k]; dk = d_arr[k]
-                inv_d = 1.0 / (dk + 1e-18)
-                nx = dxk * inv_d
-                ny = dyk * inv_d
-                nz = dzk * inv_d
-                delta_n = 2.0 * r - dk
-
-                # 相对速度
-                dvx = vx[j] - vx[i]
-                dvy = vy[j] - vy[i]
-                dvz = vz[j] - vz[i]
-                v_rel_n = dvx * nx + dvy * ny + dvz * nz
-
-                # 接触点相对速度 = v_rel - r*(ω_i + ω_j) × n
-                # ω × n 分量
-                wx = omega_x[i] + omega_x[j]
-                wy = omega_y[i] + omega_y[j]
-                wz = omega_z[i] + omega_z[j]
-                # cross(w, n) = (wy*nz - wz*ny, wz*nx - wx*nz, wx*ny - wy*nx)
-                cross_x = wy * nz - wz * ny
-                cross_y = wz * nx - wx * nz
-                cross_z = wx * ny - wy * nx
-
-                # 切向相对速度 = v_rel - v_n*n - r*(ω_i+ω_j)×n
-                vt_x = dvx - v_rel_n * nx - r * cross_x
-                vt_y = dvy - v_rel_n * ny - r * cross_y
-                vt_z = dvz - v_rel_n * nz - r * cross_z
-
-                started = started_in[k] > 0.5
-
-                if delta_n > 0.0 or started:
-                    max_abs_vn = max(max_abs_vn, abs(v_rel_n))
-                else:
-                    v_approach = -v_rel_n
-                    if v_approach > 1e-18:
-                        gap = dk - 2.0 * r
-                        t_contact = gap / v_approach
-                        min_approach_time = min(min_approach_time, t_contact)
-
-                # ========== EDEM 标准 JKR 法向力 ==========
-                Fn = 0.0
-                a_contact = 0.0
-
-                if delta_n > -alpha_f:
-                    if delta_n < 0.0 and (not started):
-                        Fn = 0.0
-                        a_contact = 0.0
-                    else:
-                        F_elastic = 0.0
-                        used_interp = False
-                        if use_interp == 1:
-                            if (delta_n > alpha_min) and (delta_n < alpha_max):
-                                t_alpha = (delta_n - alpha_min) / dalpha
-                                idx = int(t_alpha)
-                                n_tab = a_tab.size
-                                if idx < 0:
-                                    idx = 0
-                                    frac = 0.0
-                                elif idx >= n_tab - 1:
-                                    idx = n_tab - 2
-                                    frac = 1.0
-                                else:
-                                    frac = t_alpha - idx
-                                a_interp = a_tab[idx] + (a_tab[idx + 1] - a_tab[idx]) * frac
-                                F_elastic = F_tab[idx] + (F_tab[idx + 1] - F_tab[idx]) * frac
-                                if a_interp > 0.0 and F_elastic != 0.0:
-                                    a_contact = a_interp
-                                    used_interp = True
-
-                        if not used_interp:
-                            if delta_n >= 0.0:
-                                a_init = _math.sqrt(R_eff * max(delta_n, 1e-18))
-                                a = max(a_init, 0.5 * a0)
-                            else:
-                                a = a0
-
-                            for _iter in range(20):
-                                alpha_model = (a * a) / R_eff - _math.sqrt(coeff_alpha * a)
-                                f_newt = alpha_model - delta_n
-                                if abs(f_newt) < 1e-12 * max(1.0, abs(delta_n)):
-                                    break
-                                d_alpha_da = 2.0 * a / R_eff - 0.5 * _math.sqrt(coeff_alpha / max(a, 1e-30))
-                                if abs(d_alpha_da) < 1e-30:
-                                    break
-                                a_new = a - f_newt / d_alpha_da
-                                if a_new <= 0.0:
-                                    a_new = 0.5 * a
-                                a = min(a_new, 10.0 * a0)
-
-                            if a > 0.0:
-                                a_contact = a
-                                a3 = a * a * a
-                                F_hertz = (4.0 * E_star * a3) / (3.0 * R_eff)
-                                F_adhesion = _math.sqrt(8.0 * _math.pi * gamma * E_star * a3)
-                                F_elastic = F_hertz - F_adhesion
-
-                        if a_contact > 0.0:
-                            k_n = 2.0 * E_star * a_contact
-                            if beta_tsuji != 0.0 and k_n > 0.0:
-                                eta_n = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(mu_eff * k_n, 1e-18))
-                                F_damping = -eta_n * v_rel_n
-                            else:
-                                F_damping = 0.0
-                            Fn = F_elastic + F_damping
-                        else:
-                            Fn = 0.0
-                else:
-                    Fn = 0.0
-                    a_contact = 0.0
-
-                # 切向力 (3D)
-                Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
-                if a_contact > 0.0 and Fn != 0.0:
-                    k_t = 8.0 * G_star * a_contact
-                    if k_t > 0.0:
-                        # 先把历史位移投影到当前接触平面，消除法向变化带来的历史法向分量
-                        dt_prev_x = hist_in[k*3]
-                        dt_prev_y = hist_in[k*3+1]
-                        dt_prev_z = hist_in[k*3+2]
-                        dot_prev_n = dt_prev_x * nx + dt_prev_y * ny + dt_prev_z * nz
-                        dt_prev_x -= dot_prev_n * nx
-                        dt_prev_y -= dot_prev_n * ny
-                        dt_prev_z -= dot_prev_n * nz
-
-                        # 本步切向增量更新后，再投影一次以抑制数值漂移
-                        dt_hist_x = dt_prev_x + vt_x * dt
-                        dt_hist_y = dt_prev_y + vt_y * dt
-                        dt_hist_z = dt_prev_z + vt_z * dt
-                        dot_dn = dt_hist_x * nx + dt_hist_y * ny + dt_hist_z * nz
-                        dt_hist_x -= dot_dn * nx
-                        dt_hist_y -= dot_dn * ny
-                        dt_hist_z -= dot_dn * nz
-
-                        F_ct_x = -k_t * dt_hist_x
-                        F_ct_y = -k_t * dt_hist_y
-                        F_ct_z = -k_t * dt_hist_z
-
-                        if beta_tsuji != 0.0:
-                            eta_t = -2.0 * _math.sqrt(5.0 / 6.0) * beta_tsuji * _math.sqrt(max(k_t * mu_eff, 1.0e-18))
-                            F_dt_x = -eta_t * vt_x
-                            F_dt_y = -eta_t * vt_y
-                            F_dt_z = -eta_t * vt_z
-                        else:
-                            F_dt_x = 0.0; F_dt_y = 0.0; F_dt_z = 0.0
-
-                        Ft_trial_x = F_ct_x + F_dt_x
-                        Ft_trial_y = F_ct_y + F_dt_y
-                        Ft_trial_z = F_ct_z + F_dt_z
-                        Ft_trial_mag = _math.sqrt(Ft_trial_x**2 + Ft_trial_y**2 + Ft_trial_z**2)
-
-                        F_normal_eff = Fn + 2.0 * F_c
-                        F_limit_static = MU_S * abs(F_normal_eff)
-
-                        if Ft_trial_mag <= F_limit_static:
-                            Ft_x = Ft_trial_x
-                            Ft_y = Ft_trial_y
-                            Ft_z = Ft_trial_z
-                            hist_out[k*3]   = dt_hist_x
-                            hist_out[k*3+1] = dt_hist_y
-                            hist_out[k*3+2] = dt_hist_z
-                        else:
-                            F_limit_slide = MU_K * abs(F_normal_eff)
-                            vt_mag = _math.sqrt(vt_x * vt_x + vt_y * vt_y + vt_z * vt_z)
-                            if F_limit_slide > 0.0 and vt_mag > 1e-18:
-                                # 滑动方向沿 -vt（Thornton 标准）
-                                inv_vt = 1.0 / vt_mag
-                                Ft_x = -F_limit_slide * vt_x * inv_vt
-                                Ft_y = -F_limit_slide * vt_y * inv_vt
-                                Ft_z = -F_limit_slide * vt_z * inv_vt
-                                # 重置切向弹簧位移到库仑极限（方向同 -vt）
-                                hist_out[k*3]   = F_limit_static / k_t * vt_x * inv_vt
-                                hist_out[k*3+1] = F_limit_static / k_t * vt_y * inv_vt
-                                hist_out[k*3+2] = F_limit_static / k_t * vt_z * inv_vt
-                            else:
-                                Ft_x = 0.0; Ft_y = 0.0; Ft_z = 0.0
-                                hist_out[k*3] = 0.0; hist_out[k*3+1] = 0.0; hist_out[k*3+2] = 0.0
-                        contacts_mask[k] = 1.0
-                    else:
-                        hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
-                else:
-                    hist_out[k*3] = hist_in[k*3]; hist_out[k*3+1] = hist_in[k*3+1]; hist_out[k*3+2] = hist_in[k*3+2]
-
-                # 法向力 + 切向力 -> 总力
-                Fx_total = Fn * nx + Ft_x
-                Fy_total = Fn * ny + Ft_y
-                Fz_total = Fn * nz + Ft_z
-                fx[i] -= Fx_total; fy[i] -= Fy_total; fz[i] -= Fz_total
-                fx[j] += Fx_total; fy[j] += Fy_total; fz[j] += Fz_total
-
-                # 按标准公式 τ = r × F_t 计算：
-                # n 定义为 i->j，当前 Ft 定义为作用在 j 上的切向力。
-                # 对 i：r_i = +r n, F_t,i = -Ft  => τ_i = (+r n) × (-Ft)
-                # 对 j：r_j = -r n, F_t,j = +Ft  => τ_j = (-r n) × (+Ft)
-                # 两者在代数上相同，均为 -r (n × Ft)。
-                torque_x = -r * (ny * Ft_z - nz * Ft_y)
-                torque_y = -r * (nz * Ft_x - nx * Ft_z)
-                torque_z = -r * (nx * Ft_y - ny * Ft_x)
-                tau_x[i] += torque_x; tau_y[i] += torque_y; tau_z[i] += torque_z
-                tau_x[j] += torque_x; tau_y[j] += torque_y; tau_z[j] += torque_z
-
-                # 滚动阻力矩 (3D)
-                if delta_n > 0.0:
-                    T_roll = mu_r * abs(Fn) * r
-                    # 粒子 i
-                    oi_mag = _math.sqrt(omega_x[i]**2 + omega_y[i]**2 + omega_z[i]**2)
-                    if oi_mag > 1e-18:
-                        inv_oi = 1.0 / oi_mag
-                        tau_x[i] += -T_roll * omega_x[i] * inv_oi
-                        tau_y[i] += -T_roll * omega_y[i] * inv_oi
-                        tau_z[i] += -T_roll * omega_z[i] * inv_oi
-                    # 粒子 j
-                    oj_mag = _math.sqrt(omega_x[j]**2 + omega_y[j]**2 + omega_z[j]**2)
-                    if oj_mag > 1e-18:
-                        inv_oj = 1.0 / oj_mag
-                        tau_x[j] += -T_roll * omega_x[j] * inv_oj
-                        tau_y[j] += -T_roll * omega_y[j] * inv_oj
-                        tau_z[j] += -T_roll * omega_z[j] * inv_oj
-
-            return max_abs_vn, min_approach_time
 
     def _estimate_box_length(self) -> float:
         if not self.state.x.size:
@@ -757,6 +888,18 @@ class DEMSimulator:
         n = self.state.size()
         fx = np.zeros(n); fy = np.zeros(n); fz = np.zeros(n)
         tau_x = np.zeros(n); tau_y = np.zeros(n); tau_z = np.zeros(n)
+
+        # 准备并行参数
+        use_parallel = bool(getattr(self.sim, "use_numba_parallel", False))
+        num_threads = self._num_threads
+        
+        # 调试输出
+        if not hasattr(self, "_parallel_debug_printed"):
+            print(f"[DEBUG] Use Numba: {_NUMBA_AVAILABLE}")
+            print(f"[DEBUG] Use Parallel: {use_parallel}")
+            print(f"[DEBUG] Num Threads: {num_threads}")
+            self._parallel_debug_printed = True
+
 
         use_fast_numba_idx = (
             _NUMBA_AVAILABLE
@@ -797,7 +940,6 @@ class DEMSimulator:
                 started_in = self._nb_started_in[:m]
                 hist_out = self._nb_hist_out[:m*3]
                 contacts_mask = self._nb_contacts_mask[:m]
-                keys: List[Tuple[int, int]] = []
 
                 i_idx[:] = i_idx_raw
                 j_idx[:] = j_idx_raw
@@ -806,19 +948,38 @@ class DEMSimulator:
                 dz_arr[:] = dz_arr_raw
                 d_arr[:] = d_arr_raw
 
-                for k in range(m):
-                    i = int(i_idx[k]); j = int(j_idx[k])
-                    key = (i, j) if i < j else (j, i)
-                    keys.append(key)
-                    h_arr = self.tangential_hist.get(key)
-                    if h_arr is None:
-                        hist_in[k*3] = 0.0; hist_in[k*3+1] = 0.0; hist_in[k*3+2] = 0.0
-                    else:
-                        hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
-                    started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
+                # 使用 _pair_index + _pair_hist 数组进行快速历史查找
+                # 替代逐对 Python dict.get 循环
+                old_pair_index = self._pair_index
+                old_pair_hist = self._pair_hist
+                old_pair_started = self._pair_started_arr
+                keys: List[Tuple[int, int]] = [None] * m  # type: ignore
+                hist_in[:] = 0.0
+                started_in[:] = 0.0
+                if old_pair_hist is not None and old_pair_started is not None and old_pair_index:
+                    for k in range(m):
+                        i = int(i_idx[k]); j = int(j_idx[k])
+                        key = (i, j) if i < j else (j, i)
+                        keys[k] = key
+                        old_k = old_pair_index.get(key, -1)
+                        if old_k >= 0:
+                            hist_in[k*3]   = old_pair_hist[old_k*3]
+                            hist_in[k*3+1] = old_pair_hist[old_k*3+1]
+                            hist_in[k*3+2] = old_pair_hist[old_k*3+2]
+                            started_in[k]  = old_pair_started[old_k]
+                else:
+                    for k in range(m):
+                        i = int(i_idx[k]); j = int(j_idx[k])
+                        key = (i, j) if i < j else (j, i)
+                        keys[k] = key
+                        h_arr = self.tangential_hist.get(key)
+                        if h_arr is not None:
+                            hist_in[k*3] = h_arr[0]; hist_in[k*3+1] = h_arr[1]; hist_in[k*3+2] = h_arr[2]
+                        started_in[k] = 1.0 if self.contact_started.get(key, False) else 0.0
 
                 eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-                nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+
+                kern_args = (
                     n,
                     i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
                     self.state.vx, self.state.vy, self.state.vz,
@@ -838,13 +999,33 @@ class DEMSimulator:
                     tau_x, tau_y, tau_z,
                     hist_out, contacts_mask,
                 )
+                if use_parallel:
+                    self._ensure_parallel_buf(n)
+                    nb_max_vn, nb_min_at = _numba_force_kernel_parallel(
+                        num_threads, *kern_args,
+                        self._nb_fx_temp, self._nb_fy_temp, self._nb_fz_temp,
+                        self._nb_tx_temp, self._nb_ty_temp, self._nb_tz_temp,
+                        self._nb_mvn_temp, self._nb_mat_temp,
+                    )
+                else:
+                    nb_max_vn, nb_min_at = _numba_force_kernel(*kern_args)
 
                 contacts_2r: List[Tuple[int, int]] = []
-                for k, key in enumerate(keys):
-                    self.tangential_hist[key] = np.array([float(hist_out[k*3]), float(hist_out[k*3+1]), float(hist_out[k*3+2])])
+                # 用 _pair_hist / _pair_started_arr / _pair_index 数组化存储历史
+                # 避免逐对创建 np.array 的开销
+                new_pair_hist = np.zeros(m * 3, dtype=np.float64)
+                new_pair_started = np.zeros(m, dtype=np.float64)
+                new_pair_index: Dict[Tuple[int,int], int] = {}
+                new_pair_hist[:m*3] = hist_out[:m*3]
+                for k in range(m):
+                    key = keys[k]
+                    new_pair_index[key] = k
                     if contacts_mask[k] > 0.5:
-                        self.contact_started[key] = True
+                        new_pair_started[k] = 1.0
                         contacts_2r.append(key)
+                self._pair_hist = new_pair_hist
+                self._pair_started_arr = new_pair_started
+                self._pair_index = new_pair_index
                 self._contacts_2r = contacts_2r
                 return fx, fy, fz, tau_x, tau_y, tau_z, float(nb_max_vn), float(nb_min_at)
 
@@ -882,14 +1063,15 @@ class DEMSimulator:
                         hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                     started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
 
-            DEMSimulator._numba_build_geometry_from_idx(
+            _numba_build_geometry_from_idx(
                 self.state.x, self.state.y, self.state.z,
                 float(self.Lx), float(self.Ly), float(self.Lz),
                 i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
             )
 
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            
+            kern_args = (
                 n,
                 i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
                 self.state.vx, self.state.vy, self.state.vz,
@@ -909,6 +1091,16 @@ class DEMSimulator:
                 tau_x, tau_y, tau_z,
                 hist_out, contacts_mask,
             )
+            if use_parallel:
+                self._ensure_parallel_buf(n)
+                nb_max_vn, nb_min_at = _numba_force_kernel_parallel(
+                    num_threads, *kern_args,
+                    self._nb_fx_temp, self._nb_fy_temp, self._nb_fz_temp,
+                    self._nb_tx_temp, self._nb_ty_temp, self._nb_tz_temp,
+                    self._nb_mvn_temp, self._nb_mat_temp,
+                )
+            else:
+                nb_max_vn, nb_min_at = _numba_force_kernel(*kern_args)
             contacts_2r: List[Tuple[int,int]] = []
             if self._pair_hist is not None and self._pair_started_arr is not None:
                 self._pair_hist[:m*3] = hist_out
@@ -969,7 +1161,8 @@ class DEMSimulator:
                     hist_in[k*3] = float(h_arr[0]); hist_in[k*3+1] = float(h_arr[1]); hist_in[k*3+2] = float(h_arr[2])
                 started_in[k] = 1.0 if bool(self.contact_started.get(key, False)) else 0.0
             eta_c = float(getattr(self.jkr, "eta_c", 0.0))
-            nb_max_vn, nb_min_at = DEMSimulator._numba_force_kernel(
+            
+            kern_args = (
                 n,
                 i_idx, j_idx, dx_arr, dy_arr, dz_arr, d_arr,
                 self.state.vx, self.state.vy, self.state.vz,
@@ -989,6 +1182,16 @@ class DEMSimulator:
                 tau_x, tau_y, tau_z,
                 hist_out, contacts_mask,
             )
+            if use_parallel:
+                self._ensure_parallel_buf(n)
+                nb_max_vn, nb_min_at = _numba_force_kernel_parallel(
+                    num_threads, *kern_args,
+                    self._nb_fx_temp, self._nb_fy_temp, self._nb_fz_temp,
+                    self._nb_tx_temp, self._nb_ty_temp, self._nb_tz_temp,
+                    self._nb_mvn_temp, self._nb_mat_temp,
+                )
+            else:
+                nb_max_vn, nb_min_at = _numba_force_kernel(*kern_args)
             contacts_2r: List[Tuple[int,int]] = []
             for k, key in enumerate(keys):
                 self.tangential_hist[key] = np.array([float(hist_out[k*3]), float(hist_out[k*3+1]), float(hist_out[k*3+2])])
