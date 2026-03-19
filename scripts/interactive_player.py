@@ -131,10 +131,10 @@ class InteractivePlayer:
         self.particle_actor = self.plotter.add_mesh(
             self.glyph_mesh,
             scalars='speed',
-            cmap='viridis',
+            cmap='coolwarm',
             clim=(self.speed_min, self.speed_max),
             scalar_bar_args={
-                'title': "Speed (m/s)",
+                'title': "|v| (m/s)",
                 'vertical': True,
                 'position_x': 0.9,
                 'position_y': 0.1,
@@ -271,22 +271,27 @@ class InteractivePlayer:
             if self.state.vtk_timer_id == -1:
                 self._init_vtk_timer_fallback()
         else:
-            # This part is tricky as stopping the vtk timer is not straightforward
-            # from the callback. We'll just let it run but the _on_timer will do nothing.
-            pass
+            # Stop the timer when pausing
+            if self.state.vtk_timer_id != -1 and self.plotter.iren is not None:
+                try:
+                    self.plotter.iren.interactor.DestroyTimer(self.state.vtk_timer_id)
+                    self.state.vtk_timer_id = -1
+                except Exception as e:
+                    print(f"Warning: Could not stop timer: {e}")
         self._update_info_text()
 
     def _init_vtk_timer_fallback(self):
         """A robust way to create a repeating timer using the underlying VTK interactor."""
         if self.state.vtk_timer_id != -1:
-            return 
-        
+            return
+
         try:
             iren = self.plotter.iren.interactor
-            interval_ms = max(1, int(1000 / (self.state.fps * self.state.playback_speed)))
+            # Use fixed interval for timer, but the actual frame skipping is handled in _on_timer
+            interval_ms = max(16, int(1000 / self.state.fps))  # Minimum 16ms (60fps max)
             self.state.vtk_timer_id = iren.CreateRepeatingTimer(interval_ms)
             iren.AddObserver(vtk.vtkCommand.TimerEvent, self._on_timer)
-            print(f"VTK repeating timer started with ID: {self.state.vtk_timer_id}")
+            print(f"VTK repeating timer started with ID: {self.state.vtk_timer_id} (interval: {interval_ms}ms)")
         except Exception as e:
             print(f"Failed to create VTK timer: {e}")
             self.state.vtk_timer_id = -1
@@ -297,28 +302,37 @@ class InteractivePlayer:
             return
         self.state.playback_speed = speed
         self._update_help_text()
-        if self.state.is_playing and self.plotter.iren is not None:
-            try:
-                if self.state.vtk_timer_id != -1:
-                    self.plotter.iren.interactor.DestroyTimer(self.state.vtk_timer_id)
-                    self.state.vtk_timer_id = -1
-                self._init_vtk_timer_fallback()
-            except Exception:
-                pass
+        # No need to recreate timer when speed changes,
+        # as we now use fixed interval and handle speed in _on_timer
 
 
     def _on_timer(self, *args):
         """Callback for the timer, advances the frame if playing."""
         if not self.state.is_playing:
             return
+
+        # Calculate the next frame
         steps = max(1, int(self.state.playback_speed))
-        for _ in range(steps):
-            self._next_frame(render=False)
-        
-        # We must manually call render if we are using the VTK timer
-        # because it doesn't automatically trigger a render in the same
-        # way pyvista's `add_callback` does.
-        self.plotter.render()
+        current = self.state.current_frame
+        n_frames = self.state.n_frames
+        new_frame = current + steps
+
+        # Stop at the end instead of looping
+        if new_frame >= n_frames:
+            new_frame = n_frames - 1
+            # Stop playing when reaching the end
+            self.state.is_playing = False
+            if self.state.vtk_timer_id != -1 and self.plotter.iren is not None:
+                try:
+                    self.plotter.iren.interactor.DestroyTimer(self.state.vtk_timer_id)
+                    self.state.vtk_timer_id = -1
+                except Exception:
+                    pass
+
+        if new_frame != current:
+            self._render_frame(new_frame, update_slider=True)
+            # Ensure rendering happens
+            self.plotter.render()
 
 
     def _next_frame(self, render=True):
@@ -502,7 +516,7 @@ if __name__ == '__main__':
     import argparse
     import os
 
-    DEFAULT_FOLDER = 'data/N10_2.5e-10dt_10e-5_verlet1_h70'
+    DEFAULT_FOLDER = 'data/N10_2.5e-10dt_50e-5_verlet_h70'
     DEFAULT_FILENAME = 'trajectory.h5'
 
     parser = argparse.ArgumentParser(description='Interactive 3D Trajectory Player')
